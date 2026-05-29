@@ -1,1 +1,1 @@
-# HoffmeisterLab
+# Hoffmeister Lab Projects
