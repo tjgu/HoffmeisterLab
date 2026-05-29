@@ -1,0 +1,1420 @@
+---
+	title: "Re-looking at newly sequenced samples"
+subtitle: "March 2023"
+output:
+	html_notebook:
+	code_folding: hide
+---
+	This chunk prepares the env for analysis
+```{r}
+setwd("~/Documents/B4galt1_publication/")
+library(Seurat)
+# library(scCustomize)
+library(openxlsx)
+library(ggplot2)
+library(gprofiler2)
+library(cluster)
+library(diptest)
+library(pivottabler)
+
+#libs
+library(scater)
+library(data.table)
+library(Seurat)
+library(tidyr)
+library(ggplot2)
+# tested on R 3.4.3
+# setup required libraries and constants
+library(scater)  # tested on version 1.6.3,    install from Bioconductor: source("https://bioconductor.org/biocLite.R"); biocLite("scater")
+library(igraph)  # tested on version 1.2.1,   install from CRAN: install.packages("igraph")
+library(xgboost) # tested on version 0.6.4.1, install from CRAN: install.packages("xgboost")
+library(SeuratWrappers)
+library(tricycle)
+library(cowplot)
+library(dplyr)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(ggrepel)
+library(gridExtra)
+library(tricycle)
+library(aplot)
+library(ggpubr)
+
+
+#INPUT SAMPLES
+samples=c("LSK_KO_1", "LSK_KO_2", "LSK_KO_3", "LSK_KO_4", "LSK_KO_8", "LSK_WT_1", "LSK_WT_2", "LSK_WT_3", "LSK_WT_4", "LSK_WT_8")
+phenotypes=c("KO", "KO", "KO", "KO", "KO", "WT", "WT", "WT", "WT", "WT")
+
+#set mito cutoff here
+mito_cutoff=20
+out_dir <- paste0(paste(samples, collapse="_"),"mito_", mito_cutoff,"_seurat4.3.0_sct0.4.0_ccGenes")
+```
+Read in 10x results
+```{r}
+
+dir.create(out_dir)
+
+#############
+#FUNCTIONS
+input_10x <- function(tenx_dir, samples, phenotypes, SeuratProject)
+{
+	# print(tenx_dir)
+	samples_dir <- list.files(path=tenx_dir, pattern=paste0(samples, collapse="|"))
+	#create an empty list for seurat objects
+	samples_list <- list()
+	#populate list with seurat objects
+	for (i in 1:length(samples_dir))
+	{
+		print(paste0("loading data for: ",samples_dir[i]))
+		q <- Read10X(data.dir = paste0(tenx_dir,"/",samples_dir[i]))
+		#put seurat object for sample i into list slot i
+		samples_list[[samples_dir[i]]] <- CreateSeuratObject(counts=q, project=samples_dir[i], min.cells=3, min.features=200)
+		samples_list[[samples_dir[i]]]@meta.data$"Phenotype"=phenotypes[i]
+	}
+	return(samples_list)
+}
+
+#import samples into Seurat objects
+filtered_data_list <- input_10x(paste0("/Users/gsteinhardt/Documents/B4galt1_publication/filt_copy"), samples, phenotypes, "LSK")
+
+```
+This chunk is some QC functions from Anthony's efforts in a Wang lab project
+```{r, fig.keep='all'}
+calc_pctmt_and_plot_qc <- function(single_obj_list, pct_mt_cutoff = 100, slope = 0, intcpt = 0, above_line = FALSE) {
+  #' take in named single object list and calculate pct_mt
+#' Plot QC plots of pct_mt vs nCount and nFeature, as well as nFeature vs. nCount
+#' Accept values for cutting off by pct_mt or linearly on the nFeature vs. nCount plot. (defaults should not remove any cells)
+#' Visualize cells removed by coloring them red or blue.
+#' Plots written out to ../out_plots/qc
+#' Return named single object list
+
+
+dir.create(paste0(out_dir,"/out_plots/", names(single_obj_list), "/qc/"), recursive = TRUE)
+
+single_obj_list[[1]][["pct_mt"]] <- PercentageFeatureSet(single_obj_list[[1]], pattern = "^mt-")
+
+for (feature in c("nFeature_RNA", "nCount_RNA", "pct_mt")) {
+	for (obj in names(single_obj_list)) {
+		print(paste0(out_dir,"/out_plots/", names(single_obj_list), "/qc/histogram_", feature, "_", obj, ".png"))
+		# png(paste0("../out_plots/", names(single_obj_list), "/qc/histogram_", feature, "_", obj, ".png"))
+		hist(single_obj_list[[1]]@meta.data[[feature]], breaks=100, main = paste0(obj, " ", feature))
+		# dev.off()
+	}
+}
+
+plot_data <- single_obj_list[[1]]@meta.data[,c("nFeature_RNA", "nCount_RNA", "pct_mt")]
+to_filter_r <- subset(plot_data, subset = pct_mt > pct_mt_cutoff)
+if (above_line) {
+	to_filter_b <- plot_data[log(plot_data$nCount_RNA) > slope*log(plot_data$nFeature_RNA) + intcpt, ]
+} else {
+	to_filter_b <- plot_data[log(plot_data$nCount_RNA) < slope*log(plot_data$nFeature_RNA) + intcpt, ]
+}
+
+feature_vs_count <- ggplot(data = plot_data, mapping = aes(x = nFeature_RNA, y = nCount_RNA)) +
+	geom_point(data = to_filter_r, color="red", alpha = 0.5) +
+	geom_point(data = to_filter_b, color="blue", alpha = 0.5) + 
+	geom_point(alpha=0.05) + 
+	scale_x_continuous(trans = "log", limits = c(min(plot_data$nFeature_RNA)*.9, max(plot_data$nFeature_RNA)*1.1)) + 
+	scale_y_continuous(trans = "log", limits = c(min(plot_data$nCount_RNA)*.9, max(plot_data$nCount_RNA)*1.1)) + 
+	geom_function(fun = ~ exp(slope*log(.x) + intcpt)) +
+	ggtitle(paste0("mt%: ", pct_mt_cutoff, ", slope: ", slope, ", intercept: ", intcpt, ", above=", as.character(above_line)))
+
+ggsave(plot = feature_vs_count, filename = paste0(out_dir,"/out_plots/", names(single_obj_list), "/qc/scatter_nFeature_vs_nCount_", names(single_obj_list), ".png"))
+
+feature_vs_mt <- ggplot(data = plot_data, mapping = aes(x = nFeature_RNA, y = pct_mt)) +
+	geom_point(data = to_filter_r, color="red", alpha = 0.5) +
+	geom_point(data = to_filter_b, color="blue", alpha = 0.5) + 
+	geom_point(alpha=0.05) +
+	scale_x_continuous(trans = "log") +
+	scale_y_continuous(trans = "log")
+
+ggsave(plot = feature_vs_mt, filename = paste0(out_dir,"/out_plots/", names(single_obj_list), "/qc/scatter_nFeature_vs_pctmt_", names(single_obj_list), ".png"))
+
+count_vs_mt <- ggplot(data = plot_data, mapping = aes(x = nCount_RNA, y = pct_mt)) +
+	geom_point(data = to_filter_r, color="red", alpha = 0.5) +
+	geom_point(data = to_filter_b, color="blue", alpha = 0.5) + 
+	geom_point(alpha=0.05) +
+	scale_x_continuous(trans = "log") +
+	scale_y_continuous(trans = "log")
+
+ggsave(plot = count_vs_mt, filename = paste0(out_dir,"/out_plots/", names(single_obj_list), "/qc/scatter_nCount_vs_pctmt_", names(single_obj_list), ".png"))
+
+
+return(single_obj_list)
+}
+
+perform_qc_subsetting_and_plot <- function(single_obj_list, pct_mt_cutoff = 100, slope = 0, intcpt = 0, above_line = FALSE) {
+	#' take single-object list, subset seurat object and return
+	#' plot nFeatures vs. nCounts before and after subsetting as sanity check
+	
+	
+	# plot before and after subset for sanity check
+	before_scatter <- FeatureScatter(single_obj_list[[1]], "nFeature_RNA", "nCount_RNA") + scale_x_continuous(trans="log") + scale_y_continuous(trans="log")
+	
+	if (above_line) {
+		# if above_line is TRUE, we want to keep those cells below the line, so sign is less than 
+		single_obj_list[[1]] <- single_obj_list[[1]][, (single_obj_list[[1]]@meta.data$pct_mt < pct_mt_cutoff) & (log(single_obj_list[[1]]@meta.data$nCount_RNA) < slope*log(single_obj_list[[1]]@meta.data$nFeature_RNA) + intcpt) ]
+	} else {
+		single_obj_list[[1]] <- single_obj_list[[1]][, (single_obj_list[[1]]@meta.data$pct_mt < pct_mt_cutoff) & (log(single_obj_list[[1]]@meta.data$nCount_RNA) > slope*log(single_obj_list[[1]]@meta.data$nFeature_RNA) + intcpt) ]
+	}
+	
+	after_scatter <- FeatureScatter(single_obj_list[[1]], "nFeature_RNA", "nCount_RNA") + scale_x_continuous(trans="log") + scale_y_continuous(trans="log")
+	
+	ggsave(plot = before_scatter, filename = paste0(out_dir,"/out_plots/", names(single_obj_list), "/qc/before_subset_", names(single_obj_list), ".png"))
+	ggsave(plot = after_scatter, filename = paste0(out_dir,"/out_plots/", names(single_obj_list), "/qc/after_subset_", names(single_obj_list), ".png"))
+	
+	return(single_obj_list)
+}
+```
+This chunk is where cutoffs are set for mito and slope etc.
+```{r}
+#check out where to make cutoffs, cutoff using slope and intercept
+LSK_KO_1 <- calc_pctmt_and_plot_qc(filtered_data_list[1], pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+#perform the cutoff
+LSK_KO_1 <- perform_qc_subsetting_and_plot(LSK_KO_1, pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+
+LSK_KO_2 <- calc_pctmt_and_plot_qc(filtered_data_list[2], pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+LSK_KO_2 <- perform_qc_subsetting_and_plot(LSK_KO_2, pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+
+LSK_KO_3 <- calc_pctmt_and_plot_qc(filtered_data_list[3], pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+LSK_KO_3 <- perform_qc_subsetting_and_plot(LSK_KO_3, pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+
+#pretty much don't use this sample
+LSK_KO_4 <- calc_pctmt_and_plot_qc(filtered_data_list[4], pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+LSK_KO_4 <- perform_qc_subsetting_and_plot(LSK_KO_4, pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+
+LSK_KO_8 <- calc_pctmt_and_plot_qc(filtered_data_list[5], pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+LSK_KO_8 <- perform_qc_subsetting_and_plot(LSK_KO_8, pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+
+LSK_WT_1 <- calc_pctmt_and_plot_qc(filtered_data_list[6], pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+LSK_WT_1 <- perform_qc_subsetting_and_plot(LSK_WT_1, pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+
+LSK_WT_2 <- calc_pctmt_and_plot_qc(filtered_data_list[7], pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+LSK_WT_2 <- perform_qc_subsetting_and_plot(LSK_WT_2, pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+
+#pretty much don't use this sample
+LSK_WT_3 <- calc_pctmt_and_plot_qc(filtered_data_list[8], pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+LSK_WT_3 <- perform_qc_subsetting_and_plot(LSK_WT_3, pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+
+LSK_WT_4 <- calc_pctmt_and_plot_qc(filtered_data_list[9], pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+LSK_WT_4 <- perform_qc_subsetting_and_plot(LSK_WT_4, pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+
+LSK_WT_8 <- calc_pctmt_and_plot_qc(filtered_data_list[10], pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+LSK_WT_8 <- perform_qc_subsetting_and_plot(LSK_WT_8, pct_mt_cutoff = mito_cutoff, slope = 1.5, intcpt = -2, above_line = TRUE)
+```
+we now have a set of seurat objects in single element lists. now we make one seurat object with all samples.
+```{r}
+seurat_sampleList <- list(LSK_KO_1[[1]], LSK_KO_3[[1]], LSK_KO_8[[1]], LSK_WT_1[[1]], LSK_WT_2[[1]], LSK_WT_4[[1]], LSK_WT_8[[1]])
+#perform sctransform on all samples one at a time
+seurat_sampleList <- lapply(X = seurat_sampleList, FUN = SCTransform, vars.to.regress=c("pct_mt"))
+#get cell cycling scores from Seurat for all samples into the metadata for all cells for all samples
+mmus_s = gorth(cc.genes.updated.2019$s.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name
+mmus_g2m = gorth(cc.genes.updated.2019$g2m.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name
+
+mmus_g2m = c("Hmgb2", "Cdk1", "Nusap1", "Ube2c", "Birc5", "Tpx2", "Top2a", "Ndc80", "Cks2", "Nuf2", "Cks1b", "Mki67", "Cenpf", "Tacc3", "Pimreg", "Smc4", "Ccnb2", "Ckap2l", "Ckap2", "Aurkb", "Bub1", "Kif11", "Anp32e", "Tubb4b", "Gtse1", "Kif20b", "Hjurp", "Cdca3", "Jpt1", "Cdc20", "Ttk", "Cdc25c", "Kif2c", "Rangap1", "Ncapd2", "Dlgap5", "Cdca2", "Cdca8", "Ect2", "Kif23", "Hmmr", "Aurka", "Psrc1", "Anln", "Lbr", "Ckap5", "Cenpe", "Ctcf", "Nek2", "G2e3", "Gas2l3", "Cbx5", "Cenpa")
+
+seurat_sampleList <- lapply(seurat_sampleList, CellCycleScoring, s.features = mmus_s, g2m.features = mmus_g2m, set.ident = FALSE)
+cc.diffFunct <- function(sObject){sObject@meta.data$cc.diff <- sObject@meta.data$S.Score - sObject@meta.data$G2M.Score
+return(sObject)}
+seurat_sampleList <- lapply(seurat_sampleList, cc.diffFunct)
+#perform sctransform on each sample, model out cc diff, percent mt
+seurat_sampleList <- lapply(X=seurat_sampleList, FUN=SCTransform, vars.to.regress = c("cc.diff", "pct_mt"), return.only.var.genes=FALSE)
+
+features <- SelectIntegrationFeatures(object.list = seurat_sampleList, nfeatures = 3000)
+#prep sctransform, this is done when combining samples that have been transformed
+seurat_sampleList <- PrepSCTIntegration(object.list = seurat_sampleList, anchor.features = features)
+
+anchors <- FindIntegrationAnchors(object.list = seurat_sampleList, normalization.method = "SCT", anchor.features = features)
+combined_SCT <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
+```
+now do some quick graphs of first umap
+```{r}
+#perform PC
+combined_SCT <- RunPCA(combined_SCT, verbose = FALSE)
+ElbowPlot(combined_SCT, ndims=50)
+ggsave(paste0(out_dir,"elbowPlot.pdf"))
+#look at elbow plot, pick 20
+combined_SCT <- RunUMAP(combined_SCT, reduction = "pca", dims = 1:20)
+# DimPlot(combined_SCT, split.by="orig.ident", ncol=3)
+DimPlot(combined_SCT, split.by="orig.ident", ncol=4)
+ggsave(paste0(out_dir, "/initial_clusters.pdf"))
+FeaturePlot(combined_SCT, features="pct_mt", split.by= "orig.ident") + 
+	# patchwork::plot_layout(ncol = 3, nrow=2)
+	patchwork::plot_layout(ncol = 4, nrow=2)
+ggsave(paste0(out_dir, "/pct_mito_featurePlot.pdf"))
+#save the combined_SCT object
+```
+This chunk does a quick cluster to get rid of contaminants, removes the contaminants, re-do of PCA and umap
+Do this for outlier set A and B. Check with singleR.
+Cluster for contaminants, check with singleR
+```{r}
+# ElbowPlot(combined_SCT, ndims = 50)
+combined_SCT <- FindNeighbors(combined_SCT, dims=1:20)
+combined_SCT <- FindClusters(combined_SCT, dims=1:20, resolution=0.4)
+DimPlot(combined_SCT)
+ggsave(paste0(out_dir, "/dimplot_beforeClean.pdf"))
+
+#confirm clusters with singleR
+library(SingleR)
+library(celldex)
+igd <- ImmGenData()
+prediction <- SingleR(test = GetAssayData(combined_SCT, slot = "data", assay = "RNA"), ref = igd, labels = colData(igd)$label.fine, fine.tune = T)
+combined_SCT <- AddMetaData(combined_SCT, metadata = prediction$pruned.labels, col.name = "igd_cluster_annos")
+DimPlot(combined_SCT, group.by = "igd_cluster_annos")
+plot <- DimPlot(combined_SCT, group.by = "igd_cluster_annos")
+HoverLocator(plot = plot, information = FetchData(combined_SCT, vars = c("igd_cluster_annos", "nFeature_RNA", "pct_mt")))
+```
+This chunk does the sessioninfo
+```{r}
+saveRDS(combined_SCT, paste0(out_dir,"/combined_SCT_preClean.Rds"))
+writeLines(capture.output(sessionInfo()), paste0(out_dir,"/sessionInfo.txt"))
+```
+
+```{r}
+#remove clusters
+`%ni%` <- Negate(`%in%`)
+# BASED ON SINGLER FOR THE MANUSCRIPT, FILTER OUT CLUSTERS 11 AND 9
+x_clean <- subset(combined_SCT, seurat_clusters %ni% c(8,10))
+DimPlot(x_clean, label = TRUE) 
+ggsave(paste0(out_dir,"/dimplot_xclean_beforePCA.pdf"))
+#redo pca etc
+x_clean <- RunPCA(x_clean, verbose = FALSE)
+x_clean <- RunUMAP(x_clean, dims = 1:20, verbose = FALSE)
+DimPlot(x_clean, label=TRUE)
+ggsave(paste0(out_dir,"/dimplot_xclean_afterPCA.pdf"))
+```
+This chunk saves the cleaned integrated cells.
+```{r}
+combined_SCT <- x_clean
+rm(x_clean)
+FeaturePlot(combined_SCT, features = "pct_mt")
+ggsave(paste0(out_dir, "/perc_mt_sctCleaned.pdf"))
+saveRDS(combined_SCT, paste0(out_dir,"/combined_sct_cleaned.Rds"))
+```
+This chunk does the clustering optimization procedure,  shilouette plots
+```{r}
+sil_scores <- list()
+res_list <- seq(0.2, 0.4, length.out=20)
+lsk_obj <- combined_SCT
+lsk_obj <- FindNeighbors(lsk_obj, dims = 1:20)
+dir.create(paste0(out_dir,"/clusterOptimize"))
+
+reduction <- "pca"
+dist.matrix <- dist(x = Embeddings(object = lsk_obj[[reduction]]))
+
+for (res in res_list) {
+
+	lsk_obj <- FindClusters(lsk_obj, resolution = res, dims=1:20)
+	show(DimPlot(lsk_obj, label = TRUE, reduction = "umap") + ggtitle(label=paste0("Resolution:", res)))
+	ggsave(paste0(out_dir,"/clusterOptimize/clusterOptimize_res",res,".pdf"))
+	# silhouette metric
+
+	clusters <- lsk_obj$seurat_clusters
+	sil <- silhouette(x = as.numeric(x = as.factor(x = clusters)), dist = dist.matrix)
+	if (length(sil) > 1) {
+
+
+		plot(sil, border = NA, col=1:length(levels(clusters))) +
+			abline(v=0.2, col="red", lty=2)
+
+		sil_scores[as.character(res)] <- mean(sil[, 3])
+	} else {
+		sil_scores[as.character(res)] <- NA
+	}
+}
+dev.off()
+# png(paste0(out_dir,"/clusterOptimize_shilo.png"))
+plot(x=names(sil_scores), y=sil_scores)
+# dev.off()
+rm(lsk_obj)
+```
+From the above results, go with the 7th try
+
+```{r}
+combined_SCT <- FindNeighbors(combined_SCT, dims=1:20)
+combined_SCT <- FindClusters(combined_SCT, resolution = res_list[7], dims=1:20)
+#overwrite combined_sct with xclean, get rid of xclea
+DimPlot(combined_SCT, label=TRUE)
+ggsave(paste0(out_dir,"/clusters.pdf"))
+FeaturePlot(combined_SCT, features="pct_mt", label=TRUE)
+ggsave(paste0(out_dir,"/clusters_mito.pdf"))
+saveRDS(combined_SCT, paste0(out_dir,"/combined_SCT_finalClusters.Rds"))
+#
+```
+AFTER CLUSTERING
+This chunk looks for mitochondrial clusters
+```{r}
+#make boxplot of percentage mt for all clusters
+# combined_SCT <- readRDS("combined_SCT_finalClusters.Rds")
+QC_perc_mt <- FetchData(combined_SCT, vars=c("orig.ident", "seurat_clusters", "pct_mt"))
+ggplot(QC_perc_mt, aes(x=seurat_clusters, y=pct_mt, fill=orig.ident)) +
+	geom_boxplot()
+ggsave(paste0(out_dir,"/pctMT_boxPlotsCluster.pdf"))
+#create a umap plot for each sample
+DimPlot(combined_SCT, split.by="Phenotype", label=T)
+ggsave(paste0(out_dir, "/FIGS3B_final_clusterts_Phenotype.pdf"))
+# DimPlot(combined_SCT, split.by = "orig.ident", ncol=3, label=T)
+DimPlot(combined_SCT, split.by = "orig.ident", ncol=4, label=T)
+ggsave(paste0(out_dir,"/final_clusters_samples.pdf"))
+# FeaturePlot(combined_SCT, features=c("pct_mt"), split.by = "orig.ident", label = T) +
+#     patchwork::plot_layout(ncol = 3, nrow=2)
+FeaturePlot(combined_SCT, features=c("pct_mt"), split.by = "orig.ident", label = T) +
+	patchwork::plot_layout(ncol = 4, nrow=2)
+# ggsave(paste0(out_dir, "/samples_mito_clustes.pdf"), width = 8, height=8)
+ggsave(paste0(out_dir, "/samples_mito_clustes.pdf"), width = 12, height=8)
+
+```
+This chunk prepares the SCT slot for downstream analysis
+```{r}
+combined_SCT <- PrepSCTFindMarkers(object=combined_SCT, assay="SCT")
+#change assay to SCT for downstream analysis
+DefaultAssay(combined_SCT) <- "SCT"
+saveRDS(combined_SCT, paste0(out_dir, "/combine_SCT_prepped.Rds"))
+```
+TRANSFER LEARNING: BINARY CLASSIFIER
+```{r}
+#############
+#FUNCTIONS
+########
+readRF_data <- function(csv_path) {
+	# genes on rows, samples on columns for count data
+	counts <- t(readSparseCounts(csv_path, skip.col = 5, sep = ","))
+	# cells on rows, attributes on columns for coldata in columns 1:5
+	coldata <- as.data.frame(fread(csv_path, select = 1:5))
+	rownames(coldata) <- coldata$cell_id
+	# create Seurat object (metadata are expected to be named coldata)
+	obj <- CreateSeuratObject(counts=counts, meta.data = coldata)
+
+	# filter cells based on metadata column
+	obj <- subset(obj, pass_filter > 0.1)
+	return(obj)
+}
+
+# load all data from Rodriguez-Fraticelli
+lthsc <- readRF_data("~/Documents/5 B4galt1_KO_LSK_10X/NEW/b4galt1_ko_sc/MANUSCRIPT_MATERIALS/LSK_KO_8-LSK_WT_8/transfer_learning_cellTypes/GSE90742_RAW/GSM2411664_LTHSC.raw_umifm_counts.csv")
+sthsc <- readRF_data("~/Documents/5 B4galt1_KO_LSK_10X/NEW/b4galt1_ko_sc/MANUSCRIPT_MATERIALS/LSK_KO_8-LSK_WT_8/transfer_learning_cellTypes/GSE90742_RAW/GSM2411668_STHSC.raw_umifm_counts.csv")
+mpp2  <- readRF_data("~/Documents/5 B4galt1_KO_LSK_10X/NEW/b4galt1_ko_sc/MANUSCRIPT_MATERIALS/LSK_KO_8-LSK_WT_8/transfer_learning_cellTypes/GSE90742_RAW/GSM2411665_MPP2.raw_umifm_counts.csv")
+mpp3  <- readRF_data("~/Documents/5 B4galt1_KO_LSK_10X/NEW/b4galt1_ko_sc/MANUSCRIPT_MATERIALS/LSK_KO_8-LSK_WT_8/transfer_learning_cellTypes/GSE90742_RAW/GSM2411666_MPP3.raw_umifm_counts.csv")
+mpp4  <- readRF_data("~/Documents/5 B4galt1_KO_LSK_10X/NEW/b4galt1_ko_sc/MANUSCRIPT_MATERIALS/LSK_KO_8-LSK_WT_8/transfer_learning_cellTypes/GSE90742_RAW/GSM2411667_MPP4.raw_umifm_counts.csv")
+# combine data into one object and remove old ones
+RF_data <- merge(x=lthsc, y=c(sthsc, mpp2, mpp3, mpp4 ))
+rm(lthsc, sthsc, mpp2, mpp3, mpp4 )
+genes_meeting_proportion <- rowSums(RF_data@assays$RNA@counts > 0)/ncol(RF_data@assays$RNA@counts) > 0.001
+genes_meeting_proportion <- genes_meeting_proportion[genes_meeting_proportion]
+RF_data <- RF_data[names(genes_meeting_proportion), ]
+#Normalize like in the old version of Seurat
+RF_data <- NormalizeData(RF_data)
+RF_data <- as.SingleCellExperiment(RF_data)
+
+lsk_data <- combined_SCT
+DefaultAssay(lsk_data) <- "RNA"
+lsk_data <- NormalizeData(lsk_data)
+lsk_data <- as.SingleCellExperiment(lsk_data)
+
+BREAKS=c(-1, 0, 1, 6, Inf)
+nFeatures = 100
+
+# 1. Load datasets in scater format: loaded files expected to contain "Large SingleCellExperiment" object
+source = RF_data
+target = lsk_data
+ds1 = t(exprs(source))
+ds2 = t(exprs(target))
+sourceCellTypes = as.factor(colData(source)$library_id)
+
+# 2. Unify sets, excluding low expressed genes
+source_n_cells_counts = apply(exprs(source), 1, function(x) { sum(x > 0) } )
+target_n_cells_counts = apply(exprs(target), 1, function(x) { sum(x > 0) } )
+common_genes = intersect( rownames(source)[source_n_cells_counts>10],
+                          rownames(target)[target_n_cells_counts>10]
+)
+remove(source_n_cells_counts, target_n_cells_counts)
+ds1 = ds1[, colnames(ds1) %in% common_genes]
+ds2 = ds2[, colnames(ds2) %in% common_genes]
+ds = rbind(ds1[,common_genes], ds2[,common_genes])
+isSource = c(rep(TRUE,nrow(ds1)), rep(FALSE,nrow(ds2)))
+remove(ds1, ds2)
+
+# 3. Highest mean in both source and target
+topFeaturesAvg = colnames(ds)[order(apply(ds, 2, mean), decreasing = T)]
+
+# 4. Highest mutual information in source
+topFeaturesMi = names(sort(apply(ds[isSource,],2,function(x) { compare(cut(x,breaks=BREAKS),sourceCellTypes,method = "nmi") }), decreasing = T))
+
+# 5. Top n genes that appear in both mi and avg
+selectedFeatures = union(head(topFeaturesAvg, nFeatures) , head(topFeaturesMi, nFeatures) )
+
+# 6. remove correlated features
+tmp = cor(as.matrix(ds[,selectedFeatures]), method = "pearson")
+tmp[!lower.tri(tmp)] = 0
+selectedFeatures = selectedFeatures[apply(tmp,2,function(x) any(x < 0.9))]
+remove(tmp)
+
+# 7,8. Convert data from continous to binned dummy vars
+# break datasets to bins
+dsBins = apply(ds[, selectedFeatures], 2, cut, breaks= BREAKS)
+# use only bins with more than one value
+nUniq = apply(dsBins, 2, function(x) { length(unique(x)) })
+# convert to dummy vars
+ds = model.matrix(~ . , as.data.frame(dsBins[,nUniq>1]))
+remove(dsBins, nUniq)
+
+# 9. Classify
+train = runif(nrow(ds[isSource,]))<0.8
+# slightly different setup for multiclass and binary classification
+if (length(unique(sourceCellTypes)) > 2) {
+  xg=xgboost(data=ds[isSource,][train, ] ,
+       label=as.numeric(sourceCellTypes[train])-1,
+       objective="multi:softmax", num_class=length(unique(sourceCellTypes)),
+       eta=0.7 , nthread=5, nrounds=20, verbose=0,
+       gamma=0.001, max_depth=5, min_child_weight=10)
+} else {
+  xg=xgboost(data=ds[isSource,][train, ] ,
+       label=as.numeric(sourceCellTypes[train])-1,
+       eta=0.7 , nthread=5, nrounds=20, verbose=0,
+       gamma=0.001, max_depth=5, min_child_weight=10)
+}
+
+# 10. Predict
+predictedClasses = predict(xg, ds[!isSource, ])
+
+#"predicted" is the predicted class
+combined_SCT@meta.data$predicted <- predictedClasses
+conv <- data.frame(cellType = unique(sourceCellTypes),numCellTypes=unique(as.numeric(sourceCellTypes[train]))-1)
+for (num in conv$numCellTypes) {
+  combined_SCT@meta.data$predicted[combined_SCT@meta.data$predicted==num] <- as.character(conv[which(conv$numCellType== num),"cellType"])
+}    
+combined_SCT@meta.data$predicted <- factor(combined_SCT@meta.data$predicted,levels = c("LTHSC","STHSC", "MPP2", "MPP3", "MPP4"))
+```
+this chunk does plots for transfer learning results, binary classification
+```{r}
+#do a plot of transfer learning results separated by sample
+DimPlot(object = combined_SCT, split.by="orig.ident", group.by="predicted", ncol=4, label=TRUE)
+ggsave(paste0(out_dir,"/Castle_classification_sample.pdf"), width=10, height=6)
+#make a list of seurat objects, one list item per sample
+combinedSCT_sampleList <- SplitObject(combined_SCT, split.by="orig.ident")
+#put all the samples in the list object so plots for all are generated
+combinedSCT_sampleList$ALL <- combined_SCT
+#put WT and KO in there as well so those plots get made
+combinedSCT_sampleList$KO <- subset(combined_SCT, subset=Phenotype=="KO")
+combinedSCT_sampleList$WT <- subset(combined_SCT, subset=Phenotype=="WT")
+transf_plots_sampleList <- lapply(names(combinedSCT_sampleList), function(lskSampleName){
+	#for LSK samples, change the ident to 'prediction'
+	lskSample <- combinedSCT_sampleList[[lskSampleName]]
+	Idents(lskSample) <- lskSample@meta.data$predicted
+	ALLcells   <- WhichCells(lskSample)
+	LTHSCcells <- WhichCells(lskSample, idents = c("LTHSC"))
+	STHSCcells <- WhichCells(lskSample, idents = c("STHSC"))
+	MPP2cells  <- WhichCells(lskSample, idents = c("MPP2")) 
+	MPP3cells  <- WhichCells(lskSample, idents = c("MPP3"))
+	MPP4cells  <- WhichCells(lskSample, idents = c("MPP4"))
+	ALL   <- DimPlot(lskSample, cells.highlight = list(LTHSC=LTHSCcells), cols.highlight = c("blue")) + ggtitle(label=paste(lskSampleName,"LTHSC")) #+ theme(legend.position = "none")
+	LTHSC <- DimPlot(lskSample, cells.highlight = list(LTHSC=LTHSCcells), cols.highlight = c("blue")) + ggtitle(label=paste(lskSampleName,"LTHSC")) #+ theme(legend.position = "none")
+	STHSC <- DimPlot(lskSample, cells.highlight = list(STHSC=STHSCcells), cols.highlight = c("blue")) + ggtitle(label=paste(lskSampleName,"STHSC")) #+ theme(legend.position = "none")
+	MPP2  <- DimPlot(lskSample, cells.highlight = list(MPP2=MPP2cells), cols.highlight = c("blue")) + ggtitle(label=paste(lskSampleName,"MPP2")) #+ theme(legend.position = "none")
+	MPP3  <- DimPlot(lskSample, cells.highlight = list(MPP3=MPP3cells), cols.highlight =  c("blue")) + ggtitle(label=paste(lskSampleName,"MPP3")) #+ theme(legend.position = "none")
+	MPP4  <- DimPlot(lskSample, cells.highlight = list(MPP4=MPP4cells), cols.highlight =  c("blue")) + ggtitle(label=paste(lskSampleName,"MPP4")) #+ theme(legend.position = "none")
+	return(list(LTHSC=LTHSC, STHSC=STHSC, MPP2=MPP2, MPP3=MPP3, MPP4=MPP4))
+})
+# give names to the plot list
+names(transf_plots_sampleList) <- names(combinedSCT_sampleList)
+lapply(names(transf_plots_sampleList), function(samplePlotName) {
+	plot_grid(plotlist = transf_plots_sampleList[[samplePlotName]])
+	ggsave(paste0(out_dir, "/", samplePlotName, "_transfPlots_sm.pdf"), height=8, width=16)})
+lapply(names(transf_plots_sampleList), function(samplePlotName) {
+	plot_grid(plotlist = transf_plots_sampleList[[samplePlotName]])
+	ggsave(paste0(out_dir, "/", samplePlotName, "_transfPlots_lg.pdf"), height=20, width=40)})
+#save object up through transfer learning analysis NOT INCLUDING the probability score
+saveRDS(combined_SCT, paste0(out_dir,"/combined_SCT_transferLearning_231027.Rds"))
+
+writeLines(capture.output(sessionInfo()), paste0(out_dir,"/finalsessionInfo.txt"))
+
+```
+This chunk does plots for Supplementary Figure 4 FIGS4
+```{r}
+CD41_lineageCD41 <- lapply(levels(combined_SCT@meta.data$predicted), function(lineage){
+	lineageCells <- subset(combined_SCT, subset=predicted==lineage)
+	cd41Plot <- FeaturePlot(object=lineageCells, features="Itga2b", split.by="Phenotype") + labs(caption=lineage) + theme(legend.position = "right")
+	return(cd41Plot)
+})
+#make one big PDF with all the plots for each predicted cell type
+plot_grid(plotlist=CD41_lineageCD41, ncol=1)
+ggsave(paste0(out_dir,"/FIGS4AB_CD41exprsTransferLineage.pdf"), height=20, width=8)
+
+#do the same for B4galt1
+b4_lineageB4 <- lapply(levels(combined_SCT@meta.data$predicted), function(lineage){
+	lineageCells <- subset(combined_SCT, subset=predicted==lineage)
+	exprsPlot <- FeaturePlot(object=lineageCells, features="B4galt1",split.by="Phenotype",) + labs(caption=lineage) + theme(legend.position = "right")
+	return(exprsPlot)
+})
+plot_grid(plotlist=b4_lineageB4, ncol=1)
+ggsave(paste0(out_dir,"/FIGS4AB_B4galt1exprsTransferLineage.pdf"), height=20, width=8)
+
+```
+This chunk runs castle to get the probability score for each of the cell types, then gets the metadata from castle into the Seurat object combined_SCT
+```{r}
+# load all data from Rodriguez-Fraticelli
+lthsc <- readRF_data("~/Documents/5 B4galt1_KO_LSK_10X/NEW/b4galt1_ko_sc/MANUSCRIPT_MATERIALS/LSK_KO_8-LSK_WT_8/transfer_learning_cellTypes/GSE90742_RAW/GSM2411664_LTHSC.raw_umifm_counts.csv")
+sthsc <- readRF_data("~/Documents/5 B4galt1_KO_LSK_10X/NEW/b4galt1_ko_sc/MANUSCRIPT_MATERIALS/LSK_KO_8-LSK_WT_8/transfer_learning_cellTypes/GSE90742_RAW/GSM2411668_STHSC.raw_umifm_counts.csv")
+mpp2  <- readRF_data("~/Documents/5 B4galt1_KO_LSK_10X/NEW/b4galt1_ko_sc/MANUSCRIPT_MATERIALS/LSK_KO_8-LSK_WT_8/transfer_learning_cellTypes/GSE90742_RAW/GSM2411665_MPP2.raw_umifm_counts.csv")
+mpp3  <- readRF_data("~/Documents/5 B4galt1_KO_LSK_10X/NEW/b4galt1_ko_sc/MANUSCRIPT_MATERIALS/LSK_KO_8-LSK_WT_8/transfer_learning_cellTypes/GSE90742_RAW/GSM2411666_MPP3.raw_umifm_counts.csv")
+mpp4  <- readRF_data("~/Documents/5 B4galt1_KO_LSK_10X/NEW/b4galt1_ko_sc/MANUSCRIPT_MATERIALS/LSK_KO_8-LSK_WT_8/transfer_learning_cellTypes/GSE90742_RAW/GSM2411667_MPP4.raw_umifm_counts.csv")
+# combine data into one object
+# combine data into one object and remove old ones
+RF_data <- merge(x=lthsc, y=c(sthsc, mpp2, mpp3, mpp4 ))
+rm(lthsc, sthsc, mpp2, mpp3, mpp4 )
+genes_meeting_proportion <- rowSums(RF_data@assays$RNA@counts > 0)/ncol(RF_data@assays$RNA@counts) > 0.001
+genes_meeting_proportion <- genes_meeting_proportion[genes_meeting_proportion]
+RF_data <- RF_data[names(genes_meeting_proportion), ]
+#Normalize like in the old version of Seurat
+RF_data <- NormalizeData(RF_data)
+RF_data <- as.SingleCellExperiment(RF_data)
+
+lsk_data <- combined_SCT
+DefaultAssay(lsk_data) <- "RNA"
+lsk_data <- NormalizeData(lsk_data)
+lsk_data <- as.SingleCellExperiment(lsk_data)
+
+BREAKS=c(-1, 0, 1, 6, Inf)
+nFeatures = 100
+
+# 1. Load datasets in scater format: loaded files expected to contain "Large SingleCellExperiment" object
+source = RF_data
+target = lsk_data
+ds1 = t(exprs(source)) 
+ds2 = t(exprs(target)) 
+sourceCellTypes = as.factor(colData(source)$library_id)
+#remove unlabeled from source
+unknownLabels = levels(sourceCellTypes)[grep("not applicable|unclassified|contaminated|unknown", levels(sourceCellTypes))]
+if (length(unknownLabels)>0) {
+  hasKnownLabel = is.na(match(sourceCellTypes, unknownLabels))
+  sourceCellTypes = sourceCellTypes[hasKnownLabel]
+  sourceCellTypes = as.factor(as.character(sourceCellTypes))
+  ds1 = ds1[hasKnownLabel,]
+}
+
+# 2. Unify sets, excluding low expressed genes
+source_n_cells_counts = apply(exprs(source), 1, function(x) { sum(x > 0) } )
+target_n_cells_counts = apply(exprs(target), 1, function(x) { sum(x > 0) } )
+common_genes = intersect( colnames(ds1)[source_n_cells_counts>10], 
+                          colnames(ds2)[target_n_cells_counts>10]
+)
+remove(source_n_cells_counts, target_n_cells_counts)
+ds1 = ds1[, colnames(ds1) %in% common_genes]
+ds2 = ds2[, colnames(ds2) %in% common_genes]
+ds = rbind(ds1[,common_genes], ds2[,common_genes])
+isSource = c(rep(TRUE,nrow(ds1)), rep(FALSE,nrow(ds2)))
+remove(ds1, ds2)
+
+# 3. Highest mean in both source and target
+topFeaturesAvg = colnames(ds)[order(apply(ds, 2, mean), decreasing = T)]
+# for each cell - what is the most probable classification?
+L = length(levels(sourceCellTypes))
+targetClassification = as.data.frame(matrix(rep(0,L*sum(!isSource)), nrow=L), row.names = levels(sourceCellTypes))
+
+#convert ds to non-sparse matrix
+ds <- as.matrix(ds)
+# iterate over all source cell types
+for (cellType in levels(sourceCellTypes)) {
+  inSourceCellType = as.factor(ifelse(sourceCellTypes == cellType, cellType, paste0("NOT",cellType)))
+  # 4. Highest mutual information in source
+  topFeaturesMi = names(sort(apply(ds[isSource,],2,function(x) { compare(cut(x,breaks=BREAKS),inSourceCellType,method = "nmi") }), decreasing = T))
+  # 5. Top n genes that appear in both mi and avg
+  selectedFeatures = union(head(topFeaturesAvg, nFeatures) , head(topFeaturesMi, nFeatures) )
+  # 6. remove correlated features
+  tmp = cor(ds[,selectedFeatures], method = "pearson")
+  tmp[!lower.tri(tmp)] = 0
+  selectedFeatures = selectedFeatures[apply(tmp,2,function(x) any(x < 0.9))]
+  remove(tmp)
+  # 7,8. Convert data from continous to binned dummy vars
+  # break datasets to bins
+  dsBins = apply(ds[, selectedFeatures], 2, cut, breaks= BREAKS)
+  # use only bins with more than one value
+  nUniq = apply(dsBins, 2, function(x) { length(unique(x)) })
+  # convert to dummy vars
+  ds0 = model.matrix(~ . , as.data.frame(dsBins[,nUniq>1]))
+  remove(dsBins, nUniq)
+  cat(paste0("<h2>Classifier for ",cellType,"</h2>"))
+  inTypeSource = sourceCellTypes == cellType
+  # 9. Classify
+  xg=xgboost(data=ds0[isSource,] , 
+             label=inTypeSource,
+             objective="binary:logistic", 
+             eta=0.7 , nthread=1, nround=20, verbose=0,
+             gamma=0.001, max_depth=5, min_child_weight=10)
+  # 10. Predict
+  inTypeProb = predict(xg, ds0[!isSource, ])
+  targetClassification[cellType,] = inTypeProb
+}
+
+#get coldata into combined_SCT
+rownames(targetClassification) <- sapply(rownames(targetClassification), paste0, "_probability")
+targetClassification <- t(targetClassification)
+colData(lsk_data) <- cbind(colData(lsk_data), targetClassification)
+#check if all cell IDs are the same
+all(rownames(colData(lsk_data)) == colnames(combined_SCT)) 
+#coldata to metadata in combined_SCT
+combined_SCT@meta.data$LTHSC_probability <- colData(lsk_data)$LTHSC_probability
+combined_SCT@meta.data$STHSC_probability <- colData(lsk_data)$STHSC_probability
+combined_SCT@meta.data$MPP2_probability <- colData(lsk_data)$MPP2_probability
+combined_SCT@meta.data$MPP3_probability <- colData(lsk_data)$MPP3_probability
+combined_SCT@meta.data$MPP4_probability <- colData(lsk_data)$MPP4_probability
+```
+this chunk does plots for the probability transfer learning results
+```{r}
+#make a list of seurat objects, one list item per sample
+combinedSCT_sampleList <- SplitObject(combined_SCT, split.by="orig.ident")
+combinedSCT_sampleList$ALL <- combined_SCT
+#make KO and WT separate for plotting
+combinedSCT_sampleList$WT <- subset(x=combined_SCT, subset=Phenotype == "WT")
+combinedSCT_sampleList$KO <- subset(x=combined_SCT, subset=Phenotype == "KO")
+transf_plots_sampleList <- lapply(names(combinedSCT_sampleList), function(lskSampleName){
+	#for LSK samples, change the ident to 'prediction'
+	lskSample <- combinedSCT_sampleList[[lskSampleName]]
+	LTHSC <- FeaturePlot(lskSample, features="LTHSC_probability") + ggtitle(label=paste(lskSampleName,"LTHSC")) #+ theme(legend.position = "none")
+	STHSC <- FeaturePlot(lskSample, features="STHSC_probability") + ggtitle(label=paste(lskSampleName,"STHSC")) #+ theme(legend.position = "none")
+	MPP2 <- FeaturePlot(lskSample, features="MPP2_probability") + ggtitle(label=paste(lskSampleName,"MPP2")) #+ theme(legend.position = "none")
+	MPP3 <- FeaturePlot(lskSample, features="MPP3_probability") + ggtitle(label=paste(lskSampleName,"MPP3")) #+ theme(legend.position = "none")
+	MPP4 <- FeaturePlot(lskSample, features="MPP4_probability") + ggtitle(label=paste(lskSampleName,"MPP4")) #+ theme(legend.position = "none")
+	return(list(LTHSC=LTHSC, STHSC=STHSC, MPP2=MPP2, MPP3=MPP3, MPP4=MPP4))
+})
+# give names to the plot list
+names(transf_plots_sampleList) <- names(combinedSCT_sampleList)
+lapply(names(transf_plots_sampleList), function(samplePlotName) {
+	plot_grid(plotlist = transf_plots_sampleList[[samplePlotName]])
+	ggsave(paste0(out_dir, "/", samplePlotName, "_transfPlotsScore_sm.pdf"), height=8, width=16)})
+lapply(names(transf_plots_sampleList), function(samplePlotName) {
+	plot_grid(plotlist = transf_plots_sampleList[[samplePlotName]])
+	ggsave(paste0(out_dir, "/", samplePlotName, "_transfPlotsScore_lg.pdf"), height=20, width=40)})
+
+```
+this chunk does a pivot table for all samples for the transfer learning results
+```{r}
+#this should be moved to somewhere more logical, right before saving the 231027 push rds is ideal but it is already pushed...
+combined_SCT@meta.data$markers41 <- "None"
+combined_SCT@meta.data$markers41[rownames(combined_SCT@meta.data) %in% WhichCells(combined_SCT, expression = Itga2b > 0)] <- "CD41+"
+
+sample_class <- FetchData(combined_SCT, vars=c("Phenotype", "orig.ident", "seurat_clusters", "markers41", "predicted"))
+
+transferPiv <- PivotTable$new()
+transferPiv$addData(sample_class)
+
+transferPiv$addRowDataGroups("Phenotype")
+transferPiv$addRowDataGroups("orig.ident")
+transferPiv$addRowDataGroups("seurat_clusters")
+transferPiv$addColumnDataGroups("markers41")
+transferPiv$addColumnDataGroups("predicted")
+transferPiv$defineCalculation(calculationName="predicted", summariseExpression="n()")
+transferPiv$evaluatePivot()
+
+transferPivFile=paste0(out_dir,"/transferClustersPiv.xlsx")
+transferPivWB <-createWorkbook()
+addWorksheet(transferPivWB, "pivoted")
+transferPiv$writeToExcelWorksheet(wb=transferPivWB, wsName="pivoted", topRowNumber=1, leftMostColumnNumber=1)
+saveWorkbook(transferPivWB, file=transferPivFile)
+
+#some checking
+table(combined_SCT@active.ident)
+
+```
+do a pivot table for TL results and seurat phase classification
+```{r}
+sample_classPhase <- FetchData(combined_SCT, vars=c("Phenotype", "orig.ident", "Phase", "markers41", "predicted"))
+
+transferPivPhase <- PivotTable$new()
+transferPivPhase$addData(sample_classPhase)
+
+transferPivPhase$addRowDataGroups("Phenotype")
+transferPivPhase$addRowDataGroups("orig.ident")
+transferPivPhase$addRowDataGroups("Phase")
+transferPivPhase$addColumnDataGroups("markers41")
+transferPivPhase$addColumnDataGroups("predicted")
+transferPivPhase$defineCalculation(calculationName="predicted", summariseExpression="n()")
+transferPivPhase$evaluatePivot()
+
+transferPivFile=paste0(out_dir,"/transferClustersPhasePiv.xlsx")
+transferPivWB <-createWorkbook()
+addWorksheet(transferPivWB, "TL_phase_pivoted")
+transferPivPhase$writeToExcelWorksheet(wb=transferPivWB, wsName="TL_phase_pivoted", topRowNumber=1, leftMostColumnNumber=1)
+saveWorkbook(transferPivWB, file=transferPivFile)
+
+#some checking
+table(combined_SCT@active.ident)
+
+```
+now do the pivot table for seurat phase classification
+```{r}
+q <- as.data.frame(unclass(FetchData(combined_SCT, vars=c("orig.ident", "seurat_clusters", "markers41", "Phase"))), stringsAsFactors=TRUE)
+
+q_piv <- PivotTable$new()
+q_piv$addData(q)
+q_piv$addColumnDataGroups("markers41") 
+q_piv$addColumnDataGroups("Phase")
+q_piv$addRowDataGroups("orig.ident")
+q_piv$addRowDataGroups("seurat_clusters")
+q_piv$defineCalculation(calculationName="41_orig", summariseExpression="n()")
+q_piv$evaluatePivot()
+
+#export to output excel
+phasePivFile=paste0(out_dir,"/seuratPhaseClustersPiv.xlsx")
+phasePivWB <- createWorkbook()
+addWorksheet(phasePivWB, "pivoted")
+q_piv$writeToExcelWorksheet(wb=phasePivWB, wsName="pivoted", topRowNumber=1, leftMostColumnNumber=1)
+saveWorkbook(phasePivWB, file=phasePivFile)
+```
+FIGURE 3H: transfer learning CD41 percentage vs LTHSC probability
+```{r}
+get_tab_for_cutoff <- function(lsk_meta, cutoff, column_to_cutoff) {
+ COLS <-  c("LTHSC_probability", "MPP2_probability", "MPP3_probability","MPP4_probability", "STHSC_probability")
+ other_cols <- COLS[COLS != column_to_cutoff]
+ filtd_sheet <- lsk_meta[(lsk_meta[column_to_cutoff] > cutoff), ]
+ for (filter_col in other_cols) {
+   filtd_sheet <- filtd_sheet[(filtd_sheet[filter_col] < 0.1), ]
+ }
+ return(filtd_sheet[, "markers41"])
+}
+
+calc_cdf <- function(lsk_meta, data_colname, filter_col) {
+  cd41_percent_list <- data.frame()
+  for (cutoff in as.character(seq(0, 1, length.out=100))){
+    meta_sub <- get_tab_for_cutoff(lsk_meta, cutoff, filter_col)
+    if (length(meta_sub) > 2) {
+      pct_41plus <- table(meta_sub)/length(meta_sub)
+      cd41_percent_list[as.character(cutoff), data_colname] <- pct_41plus["CD41+"]
+    } else {
+      cd41_percent_list[as.character(cutoff), data_colname] <- NA
+    }
+    #cd41_percent_list[as.character(cutoff), "cutoff"] <- cutoff
+  }
+  return(cd41_percent_list)
+}
+
+calc_plot_data <- function(lsk_meta, filter_col) {
+  ko_meta <- lsk_meta[lsk_meta$Phenotype == "KO", ]
+  wt_meta <- lsk_meta[lsk_meta$Phenotype == "WT", ]
+  ko_cdf <- calc_cdf(ko_meta, "KO", filter_col)
+  wt_cdf <- calc_cdf(wt_meta, "WT", filter_col)
+  plot_data <- cbind(ko_cdf, wt_cdf)
+  plot_data["cutoff"] <- as.numeric(rownames(plot_data))
+  plot_data <- pivot_longer(plot_data, cols = c("WT", "KO"))
+  return(plot_data)
+}
+# lsk_meta_sheet <- lsk_data@meta.data
+lsk_meta_sheet <- combined_SCT@meta.data
+plot_list <- list()
+for (filter_col in c("LTHSC_probability", "MPP2_probability", "MPP3_probability","MPP4_probability", "STHSC_probability")) {
+  plot_data <- calc_plot_data(lsk_meta_sheet, filter_col)
+  plot_list[[filter_col]] <- ggplot(plot_data) +
+    geom_line(aes(x=cutoff, y=value, color = name)) +
+    scale_color_manual(name = "Condition", values = c(KO="red", WT="blue")) +
+    labs(y = "Percent CD41+", x=paste0("Probability Cutoff (", filter_col, " > cutoff)"))
+    ggsave(plot_list[[filter_col]], file=paste0(out_dir,"/FIG3H", filter_col,".pdf"))
+}
+# for (plot in plot_list) show(plot)
+```
+FIGURE 3, figure S4
+```{r}
+#for now we are calling LTHSCs as cluster 4 and 5, with 5 being the one as CD41+
+combinedSCT_LTHSC <-  subset(x=combined_SCT, subset=seurat_clusters %in% c("4","5"))
+combinedSCT_c4    <-  subset(x=combined_SCT, subset=seurat_clusters %in% c("4"))
+combinedSCT_c5    <-  subset(x=combined_SCT, subset=seurat_clusters %in% c("5"))
+#do a subset of cells for KO and WT for heatmap purposes
+combinedSCTlt_KO <- subset(x=combinedSCT_LTHSC, subset=Phenotype %in% c("KO"))
+combinedSCTlt_WT <- subset(x=combinedSCT_LTHSC, subset=Phenotype %in% c("WT"))
+
+#show where Itga2b (CD41) is expressed in cluster 5, also see DE genes by cluster
+#make a list object containing each sample
+
+# FIG3D Seurat phase, by sample
+DimPlot(object = combinedSCT_LTHSC, group.by="Phase", split.by="orig.ident", ncol=4)
+ggsave(paste0(out_dir,"/FIG3D_samplesLTHSCseuratPhase_sm.pdf"), height=6, width=12)
+ggsave(paste0(out_dir,"/FIG3D_samplesLTHSCseuratPhase_lg.pdf"), height=9, width=18)
+#Seurat phase, by phenotype
+DimPlot(object = combinedSCT_LTHSC, group.by="Phase",split.by="Phenotype", ncol=4)
+ggsave(paste0(out_dir,"/FIG3D_WtKoLTHSCseuratPhase_sm.pdf"), height=6, width=12)
+ggsave(paste0(out_dir,"/FIG3D_WtKoLTHSCseuratPhase_lg.pdf"), height=9, width=18)
+
+
+#aux fig S3, FIG3F, FIG3G, FIGS4C, FIGS4D: CD41 exprs by sample, LTHSC clusters together
+#also do plots for showing cluster4 and cluster5 colored
+aux_FIGS3 <- FeaturePlot(combined_SCT, features=c("Itga2b"), split.by = "Phenotype", label = TRUE, combine = FALSE)
+ggarrange(plotlist = aux_FIGS3)
+ggsave(paste0(out_dir, "/auxFIGS3_UMAP_CD41_expression.pdf"), height=5, width=10)
+
+#do this for b4galt1...
+aux_FIGS3 <- FeaturePlot(combined_SCT, features=c("B4galt1"), split.by = "Phenotype", label = TRUE, combine = FALSE)
+ggarrange(plotlist = aux_FIGS3)
+ggsave(paste0(out_dir, "/auxFIGS3_UMAP_B4galt1_expression.pdf"), height=5, width=10)
+
+DimPlot(combinedSCT_LTHSC, split.by = "Phenotype", label=TRUE)
+ggsave(paste0(out_dir,"/FIGS4C_phenoLTHSC_colorCluster_sm.pdf"), height=6, width=12)
+DimPlot(combinedSCT_LTHSC, split.by = "orig.ident", label = T, ncol=4)
+ggsave(paste0(out_dir,"/FIGS4C_samplesLTHSC_colorCluster_sm.pdf"), height=6, width=12)
+
+#both LTHSC clusters together
+FeaturePlot(combinedSCT_LTHSC, features=c("Itga2b"), split.by = "orig.ident", label = T) +
+	patchwork::plot_layout(ncol = 4, nrow=2)
+ggsave(paste0(out_dir,"/FIGS4D_samplesLTHSC_CD41_sm.pdf"), height=6, width=12)
+ggsave(paste0(out_dir,"/FIGS4D_samplesLTHSC_CD41_lg.pdf"), height=9, width=18)
+FeaturePlot(combinedSCT_LTHSC, features=c("Itga2b"), split.by = "Phenotype", label = T) 
+ggsave(paste0(out_dir,"/FIGS4D_phenoLTHSC_CD41_sm.pdf"), height=6, width=12)
+ggsave(paste0(out_dir,"/FIGS4D_phenoLTHSCCD41_lg.pdf"), height=9, width=18)
+
+#FIG3F: cluster4 (not CD41pos) only
+FeaturePlot(combinedSCT_c4, features=c("Itga2b"), split.by = "orig.ident", label = T) +
+	patchwork::plot_layout(ncol = 4, nrow=2)
+ggsave(paste0(out_dir,"/FIG3F_samplesLTHSCseuratPhase_sm.pdf"), height=6, width=12)
+ggsave(paste0(out_dir,"/FIG3F_samplesLTHSCseuratPhase_lg.pdf"), height=9, width=18)
+FeaturePlot(combinedSCT_c4, features=c("Itga2b"), split.by = "Phenotype", label = T) 
+ggsave(paste0(out_dir,"/FIG3F_phenoLTHSCseuratPhase_sm.pdf"), height=6, width=12)
+ggsave(paste0(out_dir,"/FIG3F_phenoLTHSCseuratPhase_lg.pdf"), height=9, width=18)
+
+#FIG3G: cluster5 (CD41pos LTHSC) only
+FeaturePlot(combinedSCT_c5, features=c("Itga2b"), split.by = "orig.ident", label = T) +
+	patchwork::plot_layout(ncol = 4, nrow=2)
+ggsave(paste0(out_dir,"/FIG3G_samplesLTHSCseuratPhase_sm.pdf"), height=6, width=12)
+ggsave(paste0(out_dir,"/FIG3G_samplesLTHSCseuratPhase_lg.pdf"), height=9, width=18)
+FeaturePlot(combinedSCT_c5, features=c("Itga2b"), split.by = "Phenotype", label = T) 
+ggsave(paste0(out_dir,"/FIG3G_phenoLTHSCseuratPhase_sm.pdf"), height=6, width=12)
+ggsave(paste0(out_dir,"/FIG3G_phenoLTHSCseuratPhase_lg.pdf"), height=9, width=18)
+
+#FIG3A: Bubbleplots of platelet markers
+#all LTHSC
+DotPlot(combinedSCT_LTHSC, features=c("Pf4", "Gp9", "Vwf", "Gp1ba", "Itga2b"), group.by="Phenotype") + coord_flip()	
+ggsave(paste0(out_dir,"/FIG3A_LTHSC_plateDotPlot.pdf"), height=4, width=5)
+#cluster4
+DotPlot(combinedSCT_c4, features=c("Pf4", "Gp9", "Vwf", "Gp1ba", "Itga2b"), group.by="Phenotype") + coord_flip()	
+ggsave(paste0(out_dir,"/FIG3A_c4_plateDotPlot.pdf"), height=4, width=5)
+#cluster5
+DotPlot(combinedSCT_c5, features=c("Pf4", "Gp9", "Vwf", "Gp1ba", "Itga2b"), group.by="Phenotype") + coord_flip()	
+ggsave(paste0(out_dir,"/FIG3A_c5_plateDotPlot.pdf"), height=4, width=5)
+#FIG3B: Heatmap
+DoHeatmap(combinedSCTlt_KO, features=c("Itga2b", "Pf4", "Gata1", "Vwf", "Fli1", "Mki67", "Gp9", "Gfi1b", "Gata2", "Gp1ba", "Gp5"), raster=FALSE) + ggtitle(label="KO samples, LTHSC clusters")
+ggsave(paste0(out_dir,"/FIG3Bko_LTHSC_HeatMap.pdf"), height=4, width=8)
+DoHeatmap(combinedSCTlt_WT, features=c("Itga2b", "Pf4", "Gata1", "Vwf", "Fli1", "Mki67", "Gp9", "Gfi1b", "Gata2", "Gp1ba", "Gp5"), raster=FALSE) + ggtitle(label="WT samples, LTHSC clusters")
+ggsave(paste0(out_dir,"/FIG3Bwt_LTHSC_HeatMap.pdf"), height=4, width=8)
+```
+TriCycle for FIGS4E
+```{r}
+combined_SCT <- Runtricycle(object=combined_SCT, slot = "data", reduction.name = "tricycleEmbedding",
+                 reduction.key = "tricycleEmbedding_", gname = NULL, gname.type="SYMBOL", species = "mouse")
+
+
+plot_trycycle <- FetchData(object=combined_SCT, vars = c("orig.ident", "tricycleEmbedding_1", "tricycleEmbedding_2", 
+    "tricyclePosition", "Top2a", "Phenotype", "seurat_clusters","markers41"))
+#get metadata for tricycle determined phase
+plot_trycycle$tricycleLabel <- "None"
+#sticking with quadrants, can't figure out their nomenclature
+plot_trycycle$tricycleLabel[which(plot_trycycle$tricyclePosition > 0 & 
+								  	plot_trycycle$tricyclePosition < 0.5*pi)] <- "G0/G1"
+plot_trycycle$tricycleLabel[which(plot_trycycle$tricyclePosition >= 0.5*pi & 
+								  	plot_trycycle$tricyclePosition < pi)] <- "S"
+plot_trycycle$tricycleLabel[which(plot_trycycle$tricyclePosition >= pi & 
+								  	plot_trycycle$tricyclePosition < 3*pi/2)] <- "G2M"
+plot_trycycle$tricycleLabel[which(plot_trycycle$tricyclePosition >= 3*pi/2 & 
+								  	plot_trycycle$tricyclePosition < 2*pi)] <- "G0/G1"
+
+plot_trycycle_LTHSC <- plot_trycycle[which(plot_trycycle$seurat_clusters == 4 | plot_trycycle$seurat_clusters == 5),]
+plot_trycycle_LTHSC_CD41pos <- plot_trycycle[which((plot_trycycle$seurat_clusters == 4 | plot_trycycle$seurat_clusters == 5) & 
+                                                     plot_trycycle$markers41 == "CD41+"),]
+plot_trycycle_LTHSC_CD41neg <- plot_trycycle[which((plot_trycycle$seurat_clusters == 4 | plot_trycycle$seurat_clusters == 5) & 
+                                                     plot_trycycle$markers41 == "None"),]
+
+#make plot colored by tricycle determined cell phase info
+#all LTHSC
+ggplot(plot_trycycle_LTHSC, aes(x=tricycleEmbedding_1, y=tricycleEmbedding_2, color=tricycleLabel)) +
+  geom_point() +
+  facet_wrap(~orig.ident)
+ggsave(paste0(out_dir,"/FIGS4E_clusterLTHSC_tricycle_samples.pdf"), height=5, width=8)
+ggplot(plot_trycycle_LTHSC, aes(x=tricycleEmbedding_1, y=tricycleEmbedding_2, color=tricycleLabel)) +
+  geom_point() +
+  facet_wrap(~Phenotype)
+ggsave(paste0(out_dir,"/FIGS4E_clusterLTHSC_tricycle_pheno.pdf"), height=4, width=8)
+
+# CD41pos
+ggplot(plot_trycycle_LTHSC_CD41pos, aes(x=tricycleEmbedding_1, y=tricycleEmbedding_2, color=tricycleLabel)) +
+  geom_point() +
+  facet_wrap(~orig.ident)
+ggsave(paste0(out_dir,"/FIG3J_clusterLTHSC41pos_tricycle_samples.pdf"), height=5, width=8)
+ggplot(plot_trycycle_LTHSC_CD41pos, aes(x=tricycleEmbedding_1, y=tricycleEmbedding_2, color=tricycleLabel)) +
+  geom_point() +
+  facet_wrap(~Phenotype)
+ggsave(paste0(out_dir,"/FIG3J_clusterLTHSC41pos_tricycle_pheno.pdf"), height=4, width=8)
+
+# CD41neg
+ggplot(plot_trycycle_LTHSC_CD41neg, aes(x=tricycleEmbedding_1, y=tricycleEmbedding_2, color=tricycleLabel)) +
+  geom_point() +
+  facet_wrap(~orig.ident)
+ggsave(paste0(out_dir,"/FIGS4F_clusterLTHSC41neg_tricycle_samples.pdf"), height=5, width=8)
+ggplot(plot_trycycle_LTHSC_CD41neg, aes(x=tricycleEmbedding_1, y=tricycleEmbedding_2, color=tricycleLabel)) +
+  geom_point() +
+  facet_wrap(~Phenotype)
+ggsave(paste0(out_dir,"/FIGS4F_clusterLTHSC41neg_tricycle_pheno.pdf"), height=4, width=8)
+
+
+```
+this chunk does a pivot table for the tricycle results
+```{r}
+triClustersPiv <- PivotTable$new()
+triClustersPiv$addData(plot_trycycle_LTHSC)
+
+triClustersPiv$addRowDataGroups("orig.ident")
+triClustersPiv$addColumnDataGroups("markers41") 
+triClustersPiv$addColumnDataGroups("tricycleLabel")
+triClustersPiv$defineCalculation(calculationName="tricycle", summariseExpression="n()")
+triClustersPiv$evaluatePivot()
+
+triClustersPivotfile=paste0(out_dir,"/triClustersPiv.xlsx")
+triClustersPivWB <-createWorkbook()
+addWorksheet(triClustersPivWB, "pivoted")
+triClustersPiv$writeToExcelWorksheet(wb=triClustersPivWB, wsName="pivoted", topRowNumber=1, leftMostColumnNumber=1)
+saveWorkbook(triClustersPivWB, file=triClustersPivotfile, overwrite = TRUE)
+```
+THis chunk finds all markers for all clusters
+```{r}
+# clusterMarkers <- FindAllMarkers(object = combined_SCT)
+# write.csv(x = clusterMarkers, file = paste0(out_dir,"/clusterMarkers.csv"))
+#find markers for lineages LTHSC, STHSC, MPP
+Idents(combined_SCT) <- combined_SCT@meta.data$predicted
+lineageMarkers <- FindAllMarkers(object = combined_SCT)
+write.csv(x = lineageMarkers, file = paste0(out_dir,"/lineageMarkers.csv"))
+```
+GSEA
+```{r}
+#prereq for gsea
+m_t2g <- msigdbr::msigdbr(species = "Mus musculus", category = "C2") %>% dplyr::filter(gs_subcat != "CGP") %>% dplyr::select(gs_name, entrez_gene)
+m_m3Leg  <- msigdbr::msigdbr(species = "Mus musculus", category = "C3", subcategory = "TFT:TFT_Legacy") %>% dplyr::select(gs_name, entrez_gene)
+m_m3GTRD<- msigdbr::msigdbr(species = "Mus musculus", category = "C3", subcategory = "TFT:GTRD") %>% dplyr::select(gs_name, entrez_gene)
+
+runGSEA <- function(cellInput, gseaType, gseaID, ident1, ident2, group)
+{
+	#make output dir first
+	dir.create(paste0(out_dir,"/", gseaType))
+	#get all genes from findmarkers for GSEA FOR ALL CELLS IN LT-HSC
+	delta_genes <- FindMarkers(cellInput, ident.1=ident1, ident.2=ident2, group.by=group, logfc.threshold = 0, verbose = FALSE, recorrect_umi = FALSE)
+	
+	#map genes to enterez numbers
+	delta_genes$enterez <- mapIds(org.Mm.eg.db, keys = rownames(delta_genes), keytype = "SYMBOL", column = "ENTREZID")
+	#remove rows that do not have enterez ID
+	delta_genes <- delta_genes[which(!is.na(delta_genes$enterez)),]
+	#make the thing for GSEA input
+	delta_genes_GSEA <- delta_genes$avg_log2FC
+	names(delta_genes_GSEA) <- delta_genes$enterez
+	delta_genes_GSEA <- sort(delta_genes_GSEA, decreasing=TRUE)
+	#GSEA
+	#make a list for results
+	GSEA_list_names <- c("GSEAc2", "GSEAm3Leg", "GSEAm3GTRD")
+	GSEA_list <- vector("list", length(GSEA_list_names))
+	names(GSEA_list) <- GSEA_list_names
+	GSEA_list$GSEAc2  <- GSEA(delta_genes_GSEA, TERM2GENE = m_t2g, minGSSize = 30, maxGSSize = 500, pvalueCutoff = 1)
+	# GSEA_list$GSEAc2  <- GSEA(delta_genes_GSEA, TERM2GENE = m_t2g, minGSSize = 30, maxGSSize = 500, pvalueCutoff = 1, nPerm=10000)
+	#make genes into readable symbols
+	GSEA_list$GSEAc2 <- setReadable(GSEA_list$GSEAc2, OrgDb = org.Mm.eg.db, keyType="ENTREZID")
+	GSEA_list$GSEAm3Leg <- GSEA(delta_genes_GSEA, TERM2GENE = m_m3Leg, minGSSize = 30, maxGSSize = 500, pvalueCutoff = 1)
+	# GSEA_list$GSEAm3Leg <- GSEA(delta_genes_GSEA, TERM2GENE = m_m3Leg, minGSSize = 30, maxGSSize = 500, pvalueCutoff = 1, nPerm=10000)
+	GSEA_list$GSEAm3Leg <- setReadable(GSEA_list$GSEAm3Leg, OrgDb = org.Mm.eg.db, keyType="ENTREZID")
+	GSEA_list$GSEAm3GTRD <- GSEA(delta_genes_GSEA, TERM2GENE = m_m3GTRD, minGSSize = 30, maxGSSize = 500, pvalueCutoff = 1)
+	# GSEA_list$GSEAm3GTRD <- GSEA(delta_genes_GSEA, TERM2GENE = m_m3GTRD, minGSSize = 30, maxGSSize = 500, pvalueCutoff = 1, nPerm=10000)
+	GSEA_list$GSEAm3GTRD <- setReadable(GSEA_list$GSEAm3GTRD, OrgDb = org.Mm.eg.db, keyType="ENTREZID")
+
+	#OUTPUT
+	#make the workbooks
+	delta_genes_wb <- createWorkbook()
+	GSEA_wb <- createWorkbook()
+	out_file_delta <- paste0(out_dir,"/", gseaType, "/", gseaID, "_deltaGenes.xlsx")
+	out_file_GSEA <- paste0(out_dir, "/", gseaType, "/", gseaID, "_GSEA.xlsx")
+	#deltaGenes
+	sheet_name <- paste0(gseaID,"_deltaGenes")
+	addWorksheet(wb=delta_genes_wb, sheetName=sheet_name)
+	writeData(wb=delta_genes_wb, sheet=sheet_name, x=delta_genes, startCol=1, startRow=1, rowNames=TRUE)
+	freezePane(wb=delta_genes_wb, sheet=sheet_name, firstActiveRow = 2)
+	saveWorkbook(wb=delta_genes_wb, file=out_file_delta, overwrite=TRUE)
+	#GSEA
+	sheet_name <- paste0(gseaID,"_GSEAc2")
+	addWorksheet(wb=GSEA_wb, sheetName=sheet_name)
+	writeData(wb=GSEA_wb, sheet=sheet_name, x=GSEA_list$GSEAc2, startCol=1, startRow=1, rowNames=TRUE)
+	sheet_name <- paste0(gseaID,"_GSEAm3Leg")
+	addWorksheet(wb=GSEA_wb, sheetName=sheet_name)
+	writeData(wb=GSEA_wb, sheet=sheet_name, x=GSEA_list$GSEAm3Leg, startCol=1, startRow=1, rowNames=TRUE)
+	sheet_name <- paste0(gseaID,"_GSEAm3GTRD")
+	addWorksheet(wb=GSEA_wb, sheetName=sheet_name)
+	writeData(wb=GSEA_wb, sheet=sheet_name, x=GSEA_list$GSEAm3GTRD, startCol=1, startRow=1, rowNames=TRUE)
+	saveWorkbook(wb=GSEA_wb, file=out_file_GSEA, overwrite=TRUE)
+
+	#VOLCANO PLOT
+	#get log10 of pvallue for plot
+	delta_genes$logPvalAdj <- -log10(delta_genes$p_val_adj)
+	#make color of all dots "gray" change them if they meet certain cutoffs
+	
+	#this is FC cutoff, hardcoded as 0.25 
+	delta_genes$color <- "NA"
+	delta_genes$color[delta_genes$avg_log2FC > 0.25  & delta_genes$p_val_adj < 0.05] <- "padj < 0.05, FC > 0.25"
+	delta_genes$color[delta_genes$avg_log2FC < -0.25 & delta_genes$p_val_adj < 0.05] <- "padj < 0.05, FC < -0.25"
+	delta_genes$color <- as.factor(delta_genes$color)
+	#filter out not significant ones
+	delta_genes_filt <- delta_genes[which(delta_genes$color %ni% "NA"),]
+	# delta_genes_no <- delta_genes[which(delta_genes$color == "FC < 0.25"),]
+	ggplot(delta_genes, aes(x=avg_log2FC, y=logPvalAdj, color=color, label=rownames(delta_genes))) +
+		geom_point() +
+		geom_hline(yintercept=-log10(0.05))
+	ggsave(paste0(out_dir, "/", gseaType, "/", gseaID, "_allGenes_volcano.pdf"))
+	
+	ggplot(delta_genes, aes(x=avg_log2FC, y=logPvalAdj, color=color)) +
+		geom_point() +
+		geom_text_repel(data=delta_genes_filt, aes(label=rownames(delta_genes_filt)), max.overlaps=13, size=2, force_pull=40) +
+		geom_hline(yintercept=-log10(0.05))
+	ggsave(paste0(out_dir, "/", gseaType, "/", gseaID, "_cutoffGenes_volcano.pdf"))
+	return(GSEA_list)
+}
+```
+this subsets and runs GSEA for all clusters
+SAVING RIGHT BEFORE GSESA
+```{r}
+saveRDS(combined_SCT, paste0(out_dir,"/combined_SCT_before_GSEA.Rds"))
+```
+```{r}
+#subset the cells that are CD41pos, do same thing with those
+# 
+combined_SCT41pos <- subset(x=combined_SCT, subset=markers41 %in% c("CD41+"))
+# combined_SCT41neg <- subset(x=combined_SCT, subset=markers41 %in% c("None"))
+# #get KO and WT separate for cd41pos and neg
+combined_SCT_KO <-subset(x=combined_SCT, subset=Phenotype == c("KO"))
+combined_SCT_WT <-subset(x=combined_SCT, subset=Phenotype == c("WT"))
+
+# dir.create(paste0(out_dir,"/GSEA_cluster"))
+# GSEA_cluster0 <- runGSEA(cellInput=subset(x=combined_SCT, subset=seurat_clusters %in% c("0")), gseaType="GSEA_cluster", gseaID="GSEA_cluster_0", ident1="KO", ident2="WT", group="Phenotype")
+# GSEA_cluster1 <- runGSEA(cellInput=subset(x=combined_SCT, subset=seurat_clusters %in% c("1")), gseaType="GSEA_cluster", gseaID="GSEA_cluster_1", ident1="KO", ident2="WT", group="Phenotype")
+# GSEA_cluster2 <- runGSEA(cellInput=subset(x=combined_SCT, subset=seurat_clusters %in% c("2")), gseaType="GSEA_cluster", gseaID="GSEA_cluster_2", ident1="KO", ident2="WT", group="Phenotype")
+# GSEA_cluster3 <- runGSEA(cellInput=subset(x=combined_SCT, subset=seurat_clusters %in% c("3")), gseaType="GSEA_cluster", gseaID="GSEA_cluster_3", ident1="KO", ident2="WT", group="Phenotype")
+# GSEA_cluster4 <- runGSEA(cellInput=subset(x=combined_SCT, subset=seurat_clusters %in% c("4")), gseaType="GSEA_cluster", gseaID="GSEA_cluster_4", ident1="KO", ident2="WT", group="Phenotype")
+GSEA_cluster5 <- runGSEA(cellInput=subset(x=combined_SCT, subset=seurat_clusters %in% c("5")), gseaType="GSEA_cluster", gseaID="GSEA_cluster_5", ident1="KO", ident2="WT", group="Phenotype")
+# GSEA_cluster6 <- runGSEA(cellInput=subset(x=combined_SCT, subset=seurat_clusters %in% c("6")), gseaType="GSEA_cluster", gseaID="GSEA_cluster_6", ident1="KO", ident2="WT", group="Phenotype")
+# GSEA_cluster7 <- runGSEA(cellInput=subset(x=combined_SCT, subset=seurat_clusters %in% c("7")), gseaType="GSEA_cluster", gseaID="GSEA_cluster_7", ident1="KO", ident2="WT", group="Phenotype")
+
+# #do LTHSC cluster centric GSEA
+GSEA_cluster45 <- runGSEA(cellInput=subset(x=combined_SCT, subset=seurat_clusters %in% c("4", "5")), gseaType="GSEA_cluster", gseaID="GSEA_cluster_45", ident1="KO", ident2="WT", group="Phenotype")
+GSEA_cluster45pos41 <- runGSEA(cellInput=subset(x=combined_SCT41pos, subset=seurat_clusters %in% c("4", "5")), gseaType="GSEA_cluster", gseaID="GSEA_cluster_45pos41", ident1="KO", ident2="WT", group="Phenotype")
+# #KO/WT posneg cd41 status
+GSEA_cluster45KOposneg <- runGSEA(cellInput=subset(x=combined_SCT_KO, subset=seurat_clusters %in% c("4", "5")), gseaType="GSEA_cluster", gseaID="GSEA_cluster45KOpn", ident1="CD41+", ident2="None", group="markers41")
+GSEA_cluster45WTposneg <- runGSEA(cellInput=subset(x=combined_SCT_WT, subset=seurat_clusters %in% c("4", "5")), gseaType="GSEA_cluster", gseaID="GSEA_cluster45WTpn", ident1="CD41+", ident2="None", group="markers41")
+
+#do for MPP
+GSEA_cluster5pos41 <- runGSEA(cellInput=subset(x=combined_SCT41pos, subset=seurat_clusters %in% c("5")), gseaType="GSEA_cluster", gseaID="GSEA_cluster5pos41", ident1="KO", ident2="WT", group="Phenotype")
+# this does cd41pos vs 41 neg for cluster 5
+# GSEA_cluster5KOposneg <- runGSEA(cellInput=subset(x=combined_SCT_KO, subset=seurat_clusters %in% c("5")), gseaType="GSEA_cluster", gseaID="GSEA_cluster5KOpn", ident1="CD41+", ident2="None", group="markers41")
+# GSEA_cluster5WTposneg <- runGSEA(cellInput=subset(x=combined_SCT_WT, subset=seurat_clusters %in% c("5")), gseaType="GSEA_cluster", gseaID="GSEA_cluster5WTpn", ident1="CD41+", ident2="None", group="markers41")
+
+```
+this is to run GSEA on all the cells, and transfer learning results
+```{r}
+
+options(future.globals.maxSize= 891289600)
+
+# #all cells takes too long...
+# # GSEA_allCells <- runGSEA(cellInput=combined_SCT, gseaType="Aux_GSEA", gseaID="GSEA_KOvsWT_allCells", ident1="KO", ident2="WT", group="Phenotype")
+# GSEA_transfLTHSC <- runGSEA(cellInput=subset(x=combined_SCT, subset=predicted %in% c("LTHSC")), gseaType="Aux_GSEA", gseaID="GSEA_transfLTHSC", ident1="KO", ident2="WT", group="Phenotype")
+# GSEA_transfMPP2 <- runGSEA(cellInput=subset(x=combined_SCT, subset=predicted %in% c("MPP2")), gseaType="Aux_GSEA", gseaID="GSEA_transfMPP2", ident1="KO", ident2="WT", group="Phenotype")
+# 
+# # GSEA_allCells41pos <- runGSEA(cellInput=combined_SCT41pos, gseaType="Aux_GSEA", gseaID="GSEA_KOWT41", ident1="KO", ident2="WT", group="Phenotype")
+# GSEA_transfLTHSC41pos <- runGSEA(cellInput=subset(x=combined_SCT41pos, subset=predicted %in% c("LTHSC")), gseaType="Aux_GSEA", gseaID="GSEA_tLTHSC41", ident1="KO", ident2="WT", group="Phenotype")
+# GSEA_transfMPP241pos <- runGSEA(cellInput=subset(x=combined_SCT41pos, subset=predicted %in% c("MPP2")), gseaType="Aux_GSEA", gseaID="GSEA_tMPP241", ident1="KO", ident2="WT", group="Phenotype")
+
+#this will do CD41pos vs neg for LTHSC and MPP2 as determined by transfer learning 
+GSEA_transfLTHSCKOposneg <- runGSEA(cellInput=subset(x=combined_SCT_KO, subset=predicted %in% c("LTHSC")), gseaType="Aux_GSEA", gseaID="GSEA_tLTHSCKOpn", ident1="CD41+", ident2="None", group="markers41")
+GSEA_transfLTHSCWTposneg <- runGSEA(cellInput=subset(x=combined_SCT_WT, subset=predicted %in% c("LTHSC")), gseaType="Aux_GSEA", gseaID="GSEA_tLTHSCWTpn", ident1="CD41+", ident2="None", group="markers41")
+GSEA_transfMPP2KOposneg <- runGSEA(cellInput=subset(x=combined_SCT_KO, subset=predicted %in% c("MPP2")), gseaType="Aux_GSEA", gseaID="GSEA_tMPP2KOpn", ident1="CD41+", ident2="None", group="markers41")
+GSEA_transfMPP2WTposneg <- runGSEA(cellInput=subset(x=combined_SCT_WT, subset=predicted %in% c("MPP2")), gseaType="Aux_GSEA", gseaID="GSEA_tMPP2WTpn", ident1="CD41+", ident2="None", group="markers41")
+```
+This chunk does more GSEA for a combination of CD41+ LTHSC and cluster 5 and MPP2
+```{r}
+#any cell in tLTHSC, cluster5, cluster 4, or tMPP2
+LTHSC_C5_MPP2 <- subset(x=combined_SCT, subset=(predicted == c("LTHSC")  | predicted == "MPP2" | seurat_clusters %in% c(4,5)))
+
+LTHSC_C5_MPP241pos <- subset(x=LTHSC_C5_MPP2, subset= markers41 == "CD41+")
+LTHSC_C5_MPP241neg <- subset(x=LTHSC_C5_MPP2, subset= markers41 == "None")
+
+GSEA_LTHSC_C5_MPP241pos <- runGSEA(cellInput=LTHSC_C5_MPP241pos, gseaType="GSEA_aux", gseaID="LTHSC_C5_MPP241pos", ident1="KO", ident2="WT", group="Phenotype")
+GSEA_LTHSC_C5_MPP241neg <- runGSEA(cellInput=LTHSC_C5_MPP241neg, gseaType="GSEA_aux", gseaID="LTHSC_C5_MPP241neg", ident1="KO", ident2="WT", group="Phenotype")
+
+# pMarkers <- c("Itga2b", "Pf4", "Gata1", "Vwf", "Fli1", "Mki67", "Gp9", "Gfi1b", "Gata2", "Gp1ba", "Gp5")
+# 
+# #do violin plot for platelet markers, split by 41 status
+# VlnPlot(LTHSC41_C5_MPP2, features = pMarkers, group.by = "markers41")
+# ggsave(filename=paste0(out_dir, "/GSEA_aux/pMarkers_vln.pdf"), height=10, width=10)
+```
+This chunk does GSEA plots for supplementary figure 5 B, C, E FIGS5 and adds in MPP2 results for transfer learning
+```{r}
+#Transfer learning
+#LTHSC
+#Jak-stat
+tLTHSC_GSEAplot_JakStat <- gseaplot(x = GSEA_transfLTHSC$GSEAc2, geneSetID = "KEGG_JAK_STAT_SIGNALING_PATHWAY", 
+									title = "KEGG_JAK_STAT_SIGNALING_PATHWAY\ntransfer learning LTHSC")
+tLTHSC41_GSEAplot_JakStat <- gseaplot(x = GSEA_transfLTHSC41pos$GSEAc2, geneSetID = "KEGG_JAK_STAT_SIGNALING_PATHWAY", 
+									  title = "KEGG_JAK_STAT_SIGNALING_PATHWAY\ntransfer learning LTHSC, CD41+")
+figS5B_plotList <- list(
+	tLTHSC_GSEAplot_JakStat[[1]] + theme_grey(base_size = 8),
+	tLTHSC41_GSEAplot_JakStat[[1]] + theme_grey(base_size = 8),
+	tLTHSC_GSEAplot_JakStat[[2]] + theme_grey(base_size = 8),
+	tLTHSC41_GSEAplot_JakStat[[2]] + theme_grey(base_size = 8))
+plot_list(gglist=figS5B_plotList)
+ggsave(paste0(out_dir,"/Aux_GSEA/","figS5B_tLTHSC_GSEA.pdf"))
+#MPP2
+tMPP2_GSEAplot_JakStat <- gseaplot(x = GSEA_transfMPP2$GSEAc2, geneSetID = "KEGG_JAK_STAT_SIGNALING_PATHWAY", 
+									title = "KEGG_JAK_STAT_SIGNALING_PATHWAY\ntransfer learning Mpp2")
+tMPP241_GSEAplot_JakStat <- gseaplot(x = GSEA_transfMPP241pos$GSEAc2, geneSetID = "KEGG_JAK_STAT_SIGNALING_PATHWAY", 
+									  title = "KEGG_JAK_STAT_SIGNALING_PATHWAY\ntransfer learning Mpp2, CD41+")
+figS5B_plotList <- list(
+	tMPP2_GSEAplot_JakStat[[1]] + theme_grey(base_size = 8),
+	tMPP241_GSEAplot_JakStat[[1]] + theme_grey(base_size = 8),
+	tMPP2_GSEAplot_JakStat[[2]] + theme_grey(base_size = 8),
+	tMPP241_GSEAplot_JakStat[[2]] + theme_grey(base_size = 8))
+plot_list(gglist=figS5B_plotList)
+ggsave(paste0(out_dir,"/Aux_GSEA/","figS5B_tMPP2_GSEA.pdf"))
+
+#Myc
+#LTHSC
+tLTHSC_GSEAplot_Myc <- gseaplot(x = GSEA_transfLTHSC$GSEAc2, geneSetID = "PID_MYC_ACTIV_PATHWAY", title = "PID_MYC_ACTIV_PATHWAY\ntransfer learning LTHSC")
+tLTHSC41_GSEAplot_Myc <- gseaplot(x = GSEA_transfLTHSC41pos$GSEAc2, geneSetID = "PID_MYC_ACTIV_PATHWAY", title = "PID_MYC_ACTIV_PATHWAY\ntransfer learning LTHSC, CD41+")
+figS5C_plotList <- list(
+	tLTHSC_GSEAplot_Myc[[1]] + theme_grey(base_size = 8),
+	tLTHSC41_GSEAplot_Myc[[1]] + theme_grey(base_size = 8),
+	tLTHSC_GSEAplot_Myc[[2]] + theme_grey(base_size = 8),
+	tLTHSC41_GSEAplot_Myc[[2]] + theme_grey(base_size = 8))
+plot_list(gglist=figS5C_plotList)
+ggsave(paste0(out_dir,"/Aux_GSEA/","figS5C_tLTHSC_GSEA.pdf"))
+#MPP2
+tMPP2_GSEAplot_Myc <- gseaplot(x = GSEA_transfMPP2$GSEAc2, geneSetID = "PID_MYC_ACTIV_PATHWAY", title = "PID_MYC_ACTIV_PATHWAY\ntransfer learning MPP2")
+tMPP241_GSEAplot_Myc <- gseaplot(x = GSEA_transfMPP241pos$GSEAc2, geneSetID = "PID_MYC_ACTIV_PATHWAY", title = "PID_MYC_ACTIV_PATHWAY\ntransfer learning MPP2, CD41+")
+figS5C_plotList <- list(
+	tMPP2_GSEAplot_Myc[[1]] + theme_grey(base_size = 8),
+	tMPP241_GSEAplot_Myc[[1]] + theme_grey(base_size = 8),
+	tMPP2_GSEAplot_Myc[[2]] + theme_grey(base_size = 8),
+	tMPP241_GSEAplot_Myc[[2]] + theme_grey(base_size = 8))
+plot_list(gglist=figS5C_plotList)
+ggsave(paste0(out_dir,"/Aux_GSEA/","figS5C_tMPP2_GSEA.pdf"))
+
+
+# FIGS5E: CD41+ vs CD41-
+#transferLearning LTHSC
+#Jak-Stat
+tLTHSC_GSEAplot_KOposneg_JakStat <- gseaplot(x=GSEA_transfLTHSCKOposneg$GSEAc2, geneSetID = "KEGG_JAK_STAT_SIGNALING_PATHWAY", 
+									title = "KEGG_JAK_STAT_SIGNALING_PATHWAY\ntransfer learning LTHSC, KO samples CD41+/CD41-")
+tLTHSC_GSEAplot_WTposneg_JakStat <- gseaplot(x=GSEA_transfLTHSCWTposneg$GSEAc2, geneSetID = "KEGG_JAK_STAT_SIGNALING_PATHWAY", 
+									title = "KEGG_JAK_STAT_SIGNALING_PATHWAY\ntransfer learning LTHSC, WT samples CD41+/CD41-")
+#Myc
+tLTHSC_GSEAplot_KOposneg_Myc <- gseaplot(x=GSEA_transfLTHSCKOposneg$GSEAc2, geneSetID = "PID_MYC_ACTIV_PATHWAY", 
+									title = "PID_MYC_ACTIV_PATHWAY\ntransfer learning LTHSC, KO samples CD41+/CD41-")
+tLTHSC_GSEAplot_WTposneg_Myc <- gseaplot(x=GSEA_transfLTHSCWTposneg$GSEAc2, geneSetID = "PID_MYC_ACTIV_PATHWAY", 
+									title = "PID_MYC_ACTIV_PATHWAY\ntransfer learning LTHSC, WT samples CD41+/CD41-")
+figS5E_plotList <- list(
+	tLTHSC_GSEAplot_KOposneg_JakStat[[1]] + theme_grey(base_size = 8),
+	tLTHSC_GSEAplot_KOposneg_Myc[[1]] + theme_grey(base_size = 8),
+	tLTHSC_GSEAplot_KOposneg_JakStat[[2]] + theme_grey(base_size = 8),
+	tLTHSC_GSEAplot_KOposneg_Myc[[2]] + theme_grey(base_size = 8))
+plot_list(gglist=figS5E_plotList)
+ggsave(paste0(out_dir,"/Aux_GSEA/","figS5E_tLTHSC_KO_41posneg_GSEA.pdf"))
+figS5E_plotList <- list(
+	tLTHSC_GSEAplot_WTposneg_JakStat[[1]] + theme_grey(base_size = 8),
+	tLTHSC_GSEAplot_WTposneg_Myc[[1]] + theme_grey(base_size = 8),
+	tLTHSC_GSEAplot_WTposneg_JakStat[[2]] + theme_grey(base_size = 8),
+	tLTHSC_GSEAplot_WTposneg_Myc[[2]] + theme_grey(base_size = 8))
+plot_list(gglist=figS5E_plotList)
+ggsave(paste0(out_dir,"/Aux_GSEA/","figS5E_tLTHSC_WT_41posneg_GSEA.pdf"))
+
+#Figure S5G vlnplots
+#TL LTHSC
+VlnPlot(subset(x=combined_SCT, subset=predicted %in% c("LTHSC")), features = "Ldha", group.by = "Phenotype")
+ggsave(paste0(out_dir,"/FIGS5G_LdhaVlnPlot_tLTHSC.pdf"), height = 7, width=5)
+VlnPlot(subset(x=combined_SCT41pos, subset=predicted %in% c("LTHSC")), features = "Ldha", group.by = "Phenotype")
+ggsave(paste0(out_dir,"/FIGS5G_LdhaVlnPlot_tLTHSC41pos.pdf"), height = 7, width=5)
+
+#dotplots for figure S5H
+dotplotSets <- c("REACTOME_METABOLISM_OF_AMINO_ACIDS_AND_DERIVATIVES",
+				 "REACTOME_SELENOAMINO_ACID_METABOLISM","REACTOME_METABOLISM_OF_POLYAMINES", 
+				 "WP_METABOLIC_REPROGRAMMING_IN_COLON_CANCER", "REACTOME_PYRUVATE_METABOLISM_AND_CITRIC_ACID_TCA_CYCLE",
+				 "REACTOME_METABOLISM_OF_NUCLEOTIDES", "WP_PYRIMIDINE_METABOLISM",
+				 "KEGG_PYRIMIDINE_METABOLISM", "KEGG_PURINE_METABOLISM",
+				 "WP_CHOLESTEROL_METABOLISM_WITH_BLOCH_AND_KANDUTSCHRUSSELL_PATHWAYS", 
+				 "REACTOME_METABOLISM_OF_CARBOHYDRATES", "REACTOME_RESPONSE_TO_ELEVATED_PLATELET_CYTOSOLIC_CA2",
+				 "REACTOME_PLATELET_ACTIVATION_SIGNALING_AND_AGGREGATION")
+dp <- dotplot(GSEA_transfLTHSC41pos$GSEAc2, showCategory=dotplotSets)
+ggsave(filename=paste0(out_dir, "/Aux_GSEA/FIGS5H_GSEA_tLTHSC41pos_dotplots.pdf"), height=10, width=8)
+```
+This chunk does GSEA plots for cluster
+```{r}
+#LTHSC
+#Jak-stat
+cLTHSC_GSEAplot_JakStat <- gseaplot(x = GSEA_cluster45$GSEAc2, geneSetID = "KEGG_JAK_STAT_SIGNALING_PATHWAY", 
+									title = "KEGG_JAK_STAT_SIGNALING_PATHWAY\nclusters 4,5 LTHSC")
+cLTHSC41_GSEAplot_JakStat <- gseaplot(x = GSEA_cluster45pos41$GSEAc2, geneSetID = "KEGG_JAK_STAT_SIGNALING_PATHWAY", 
+									  title = "KEGG_JAK_STAT_SIGNALING_PATHWAY\nclusters 4,5, CD41+")
+figS5B_plotList <- list(
+	cLTHSC_GSEAplot_JakStat[[1]] + theme_grey(base_size = 8),
+	cLTHSC41_GSEAplot_JakStat[[1]] + theme_grey(base_size = 8),
+	cLTHSC_GSEAplot_JakStat[[2]] + theme_grey(base_size = 8),
+	cLTHSC41_GSEAplot_JakStat[[2]] + theme_grey(base_size = 8))
+plot_list(gglist=figS5B_plotList)
+ggsave(paste0(out_dir,"/GSEA_cluster/","figS5B_cLTHSC_GSEA.pdf"))
+#MPP2
+cMPP2_GSEAplot_JakStat <- gseaplot(x = GSEA_cluster5$GSEAc2, geneSetID = "KEGG_JAK_STAT_SIGNALING_PATHWAY", 
+									title = "KEGG_JAK_STAT_SIGNALING_PATHWAY\nclusters 5 MPP2")
+cMPP241_GSEAplot_JakStat <- gseaplot(x = GSEA_cluster5pos41$GSEAc2, geneSetID = "KEGG_JAK_STAT_SIGNALING_PATHWAY", 
+									  title = "KEGG_JAK_STAT_SIGNALING_PATHWAY\ncluster 5 MPP2, CD41+")
+figS5B_plotList <- list(
+	cMPP2_GSEAplot_JakStat[[1]] + theme_grey(base_size = 8),
+	cMPP241_GSEAplot_JakStat[[1]] + theme_grey(base_size = 8),
+	cMPP2_GSEAplot_JakStat[[2]] + theme_grey(base_size = 8),
+	cMPP241_GSEAplot_JakStat[[2]] + theme_grey(base_size = 8))
+plot_list(gglist=figS5B_plotList)
+ggsave(paste0(out_dir,"/GSEA_cluster/","figS5B_cMPP2_GSEA.pdf"))
+
+#Myc
+#LTHSC
+cLTHSC_GSEAplot_Myc <- gseaplot(x = GSEA_cluster45$GSEAc2, geneSetID = "PID_MYC_ACTIV_PATHWAY", title = "PID_MYC_ACTIV_PATHWAY\nclusters 4,5 LTHSC")
+cLTHSC41_GSEAplot_Myc <- gseaplot(x = GSEA_cluster45pos41$GSEAc2, geneSetID = "PID_MYC_ACTIV_PATHWAY", title = "PID_MYC_ACTIV_PATHWAY\nclusters 4,5 LTHSC, CD41+")
+figS5C_plotList <- list(
+	cLTHSC_GSEAplot_Myc[[1]] + theme_grey(base_size = 8),
+	cLTHSC41_GSEAplot_Myc[[1]] + theme_grey(base_size = 8),
+	cLTHSC_GSEAplot_Myc[[2]] + theme_grey(base_size = 8),
+	cLTHSC41_GSEAplot_Myc[[2]] + theme_grey(base_size = 8))
+plot_list(gglist=figS5C_plotList)
+ggsave(paste0(out_dir,"/GSEA_cluster/","figS5C_cLTHSC_GSEA.pdf"))
+#MPP2
+cMPP2_GSEAplot_Myc <- gseaplot(x = GSEA_cluster5$GSEAc2, geneSetID = "PID_MYC_ACTIV_PATHWAY", title = "PID_MYC_ACTIV_PATHWAY\ncluster 5 MPP2")
+cMPP241_GSEAplot_Myc <- gseaplot(x = GSEA_cluster5pos41$GSEAc2, geneSetID = "PID_MYC_ACTIV_PATHWAY", title = "PID_MYC_ACTIV_PATHWAY\ncluster 5 MPP2, CD41+")
+figS5C_plotList <- list(
+	cMPP2_GSEAplot_Myc[[1]] + theme_grey(base_size = 8),
+	cMPP241_GSEAplot_Myc[[1]] + theme_grey(base_size = 8),
+	cMPP2_GSEAplot_Myc[[2]] + theme_grey(base_size = 8),
+	cMPP241_GSEAplot_Myc[[2]] + theme_grey(base_size = 8))
+plot_list(gglist=figS5C_plotList)
+ggsave(paste0(out_dir,"/GSEA_cluster/","figS5C_cMPP2_GSEA.pdf"))
+
+
+# FIGS5E: CD41+ vs CD41-
+#Jak-Stat
+cLTHSC_GSEAplot_KOposneg_JakStat <- gseaplot(x=GSEA_cluster45KOposneg$GSEAc2, geneSetID = "KEGG_JAK_STAT_SIGNALING_PATHWAY", 
+									title = "KEGG_JAK_STAT_SIGNALING_PATHWAY\nclusters 4,5 LTHSC, KO samples CD41+/CD41-")
+cLTHSC_GSEAplot_WTposneg_JakStat <- gseaplot(x=GSEA_cluster45WTposneg$GSEAc2, geneSetID = "KEGG_JAK_STAT_SIGNALING_PATHWAY", 
+									title = "KEGG_JAK_STAT_SIGNALING_PATHWAY\nclusters 4,5 LTHSC, WT samples CD41+/CD41-")
+#Myc
+cLTHSC_GSEAplot_KOposneg_Myc <- gseaplot(x=GSEA_cluster45KOposneg$GSEAc2, geneSetID = "PID_MYC_ACTIV_PATHWAY", 
+									title = "PID_MYC_ACTIV_PATHWAY\nclusters 4,5 LTHSC, KO samples CD41+/CD41-")
+cLTHSC_GSEAplot_WTposneg_Myc <- gseaplot(x=GSEA_cluster45WTposneg$GSEAc2, geneSetID = "PID_MYC_ACTIV_PATHWAY", 
+									title = "PID_MYC_ACTIV_PATHWAY\nclusters 4,5 LTHSC, WT samples CD41+/CD41-")
+figS5E_plotList <- list(
+	cLTHSC_GSEAplot_KOposneg_JakStat[[1]] + theme_grey(base_size = 8),
+	cLTHSC_GSEAplot_KOposneg_Myc[[1]] + theme_grey(base_size = 8),
+	cLTHSC_GSEAplot_KOposneg_JakStat[[2]] + theme_grey(base_size = 8),
+	cLTHSC_GSEAplot_KOposneg_Myc[[2]] + theme_grey(base_size = 8))
+plot_list(gglist=figS5E_plotList)
+ggsave(paste0(out_dir,"/GSEA_cluster/","figS5E_cLTHSC_KO_41posneg_GSEA.pdf"))
+figS5E_plotList <- list(
+	cLTHSC_GSEAplot_WTposneg_JakStat[[1]] + theme_grey(base_size = 8),
+	cLTHSC_GSEAplot_WTposneg_Myc[[1]] + theme_grey(base_size = 8),
+	cLTHSC_GSEAplot_WTposneg_JakStat[[2]] + theme_grey(base_size = 8),
+	cLTHSC_GSEAplot_WTposneg_Myc[[2]] + theme_grey(base_size = 8))
+plot_list(gglist=figS5E_plotList)
+ggsave(paste0(out_dir,"/GSEA_cluster/","figS5E_cLTHSC_WT_41posneg_GSEA.pdf"))
+
+
+#Figure S5G
+#cluster determined LTHSC
+VlnPlot(subset(x=combined_SCT, subset=seurat_clusters %in% c("4","5")), features = "Ldha", group.by = "Phenotype")
+ggsave(paste0(out_dir,"/FIGS5G_LdhaVlnPlot_cLTHSC.pdf"), height = 7, width=5)
+VlnPlot(subset(x=combined_SCT41pos, subset=seurat_clusters %in% c("4","5")), features = "Ldha", group.by = "Phenotype")
+ggsave(paste0(out_dir,"/FIGS5G_LdhaVlnPlot_cLTHSC41pos.pdf"), height = 7, width=5)
+
+```
+These chunks do supplementary figures, MolO and Basu scores and marker genes, also one UMAP of CASTLE defined lineages by phenotype
+This chunk will get MolO scores for cells arcoss clusters.
+```{r, warning=FALSE, results='hide',fig.keep='all'}
+library(ggplot2)
+molo_markers <- list(c("Procr", "Pdzk1ip1", "Ltb", "Mllt3", "Ifitm1", "Gimap1", "Gimap6", "Limd2", "Trim47", "Neil2", "Vwf", "Pde1b", "Neo1", "Sqrdl", "Sult1a1", "Cd82", "Ramp2", "Ubl3", "Ly6a", "Cdkn1c", "Fgfr3", "Cldn10", "Ptpn14", "Mettl7a1", "Smtnl1", "Ctsf", "Gstm1", "Sox18", "Fads3"))
+combined_SCT <- AddModuleScore(object=combined_SCT, features=molo_markers, name="MolO_moduleScore")
+moloClusters <- FeaturePlot(combined_SCT, features="MolO_moduleScore1", label=T) + scale_colour_gradient2(low = "blue", mid = "#e6e6e6", high = "orange", midpoint = 0)
+
+# FeaturePlot(lsk_obj, features = "molo_markers1") + scale_colour_gradient2(low = "blue", mid = "#e6e6e6", high = "orange", midpoint = 0)
+
+boxes <- combined_SCT@meta.data[,c("MolO_moduleScore1","seurat_clusters", "orig.ident")]
+moloBoxSamples <- ggplot(boxes, aes(x=seurat_clusters, y=MolO_moduleScore1, fill=orig.ident)) + geom_boxplot()
+moloBoxAll <- ggplot(boxes, aes(x=seurat_clusters, y=MolO_moduleScore1)) + geom_boxplot()
+
+ggsave(moloClusters, file=paste0(out_dir,"/FIGS3E_moloClusters.pdf"))
+ggsave(moloBoxSamples, file=paste0(out_dir,"/FIGS3E_moloBoxSamples.pdf"))
+ggsave(moloBoxAll, file=paste0(out_dir,"/FIGS3E_moloBoxAll.pdf"))
+
+molo_genes_forStats <- FetchData(object=combined_SCT, vars=c("seurat_clusters", "MolO_moduleScore1"))
+molo_model <- aov(MolO_moduleScore1~seurat_clusters, data=molo_genes_forStats)
+molo_statsTable <- TukeyHSD(molo_model, conf.level=0.99)
+write.table(x=molo_statsTable$seurat_clusters, file=paste0(out_dir,"/FIGS3E_moloSatsTable.txt"), sep="\t", quote=F)
+
+DimPlot(combined_SCT, split.by="Phenotype", group.by="predicted", label=TRUE)
+ggsave(paste0(out_dir,"/FIGS3B_castlePrediction_phenotype.pdf"), height=6, width=12)
+```
+From "Role of Thrombomodulin expression on hematopoietic stem cells"  
+```{r, warning=FALSE, results='hide',fig.keep='all'}
+HSC_up <- read.table("~/Documents/5 B4galt1_KO_LSK_10X/Seurat_analysis/george_investigation/HSC_up_list.txt")
+HSC_dn <- read.table("~/Documents/5 B4galt1_KO_LSK_10X/Seurat_analysis/george_investigation/HSC_down_list.txt")
+HSC_up_list <- list(HSC_up$V1)
+HSC_dn_list <- list(HSC_dn$V1)
+combined_SCT <- AddModuleScore(object=combined_SCT, features=HSC_up_list, name="HSC_up")
+combined_SCT <- AddModuleScore(object=combined_SCT, features=HSC_dn_list, name="HSC_dn")
+basuClusters <- FeaturePlot(combined_SCT, features="HSC_up1", label = T, cols = c("gray", "red"))
+boxes <- combined_SCT@meta.data[,c("HSC_up1","seurat_clusters", "orig.ident")]
+basuBoxSamples <- ggplot(boxes, aes(x=seurat_clusters, y=HSC_up1, fill=orig.ident)) + geom_boxplot()
+basuBoxAll <- ggplot(boxes, aes(x=seurat_clusters, y=HSC_up1)) + geom_boxplot()
+
+ggsave(basuClusters, file=paste0(out_dir,"/FIGS3E_basuClusters.pdf"))
+ggsave(basuBoxSamples, file=paste0(out_dir,"/FIGS3E_basuBoxSamples.pdf"))
+ggsave(basuBoxAll, file=paste0(out_dir,"/FIGS3E_basuBoxAll.pdf"))
+
+HSC_genes_forStats <- FetchData(object=combined_SCT, vars=c("seurat_clusters", "HSC_up1"))
+HSC_model <- aov(HSC_up1~seurat_clusters, data=HSC_genes_forStats)
+HSC_statsTable <- TukeyHSD(HSC_model, conf.level=0.99)
+write.table(x=HSC_statsTable$seurat_clusters, file=paste0(out_dir,"/FIGS3E_basuStatsTable.txt"), sep="\t", quote=F)
+
+#get actual molo and HSC scores for each cluster
+fetched_median <- data.frame(cluster=c(levels(combined_SCT)), molo_score=NA, HSC_score=NA)
+rownames(fetched_median) <- fetched_median$cluster
+for (i in levels(combined_SCT))
+{
+  fetched <- FetchData(object=combined_SCT, vars=c("seurat_clusters", "MolO_moduleScore1", "HSC_up1"))
+  fetched <- fetched[which(fetched$seurat_clusters == i),]
+  fetched_median[i, 'molo_score'] <- median(fetched$MolO_moduleScore1)
+  fetched_median[i,'HSC_score'] <- median(fetched$HSC_up1)
+}
+write.table(fetched_median, paste0(out_dir, "/molo_basu_scoresTable.txt"), sep="\t", quote=F, row.names=FALSE)
+```
+This chunk generates vln plots of some LTHSC marker genes, only items required of figure S3 tho....
+```{r, fig.height=8, fig.width=20, warning=FALSE, results='hide',fig.keep='all'}
+library(ggpubr)
+LTHSC_markers <- c("Cd48", "Slamf1", "Flt3", "Procr")
+platelet_markers <- c("Pf4", "Gp9", "Vwf", "Gp1ba", "Itga2b")
+vln_LTHSC_figure <- VlnPlot(combined_SCT, features=LTHSC_markers, ncol=2) + theme(legend.position = 'right')
+vln_platelet_figure <- VlnPlot(combined_SCT, features=platelet_markers, ncol=3) + theme(legend.position = 'right')
+
+vln_LTHSC_figure_phenoSplit <- VlnPlot(combined_SCT, features=LTHSC_markers, ncol=2, split.by = "Phenotype") + theme(legend.position = 'right')
+vln_platelet_figure_phenoSplit <- VlnPlot(combined_SCT, features=platelet_markers, ncol=3, split.by="Phenotype") + theme(legend.position = 'right')
+
+plot(vln_LTHSC_figure)
+ggsave(file=paste0(out_dir,"/FIGS3F_vlnMarkers.pdf"), width=15, height=8)
+plot(vln_platelet_figure)
+ggsave(file=paste0(out_dir,"/vln_markers_plateletBiased_figure.pdf"), width=15, height=8)
+
+plot(vln_LTHSC_figure_phenoSplit)
+ggsave(file=paste0(out_dir,"/FIGS3F_vlnMarkers_phenoSplit.pdf"), width=15, height=8)
+plot(vln_platelet_figure_phenoSplit)
+ggsave(file=paste0(out_dir,"/vln_markers_plateletBiased_figure_phenoSplit.pdf"), width=15, height=8)
+
+#STATS: LT-HSC markers
+#FURTHER, get stats for some marker genes across clusters
+LTHSC_markers_stats <- FindAllMarkers(object=combined_SCT, features=LTHSC_markers, logfc.threshold=0)
+write.table(LTHSC_markers_stats, file=paste0(out_dir,"/LTHSC_markers_stats.txt"), sep="\t", quote=F)
+# platelet_markers_stats <- FindAllMarkers(object=x, features=platelet_markers, logfc.threshold=0)
+# write.table(platelet_markers_stats, file=paste0(out_dir,"/platelet_markers_stats.txt"), sep="\t", quote=F)
+
+# DotPlot(x, features=platelet_markers)
+# ggsave(paste0(out_dir,"/platelet_dotplot_all_clusters.pdf"))
+# DotPlot(subset(x=x, subset=seurat_clusters %in% c("1","5")), features=platelet_markers, group.by = "Phenotype")
+# ggsave(paste0(out_dir,"/platelet_dotplot_LTHSCclusters.pdf"))
+```
